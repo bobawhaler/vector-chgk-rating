@@ -1,0 +1,78 @@
+"""Unit tests for data caching, format filtering, and synthetic dataset generation."""
+
+from __future__ import annotations
+
+import tempfile
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+from chgk_rating.config import FORMAT_OFFLINE, FORMAT_ONLINE, FORMAT_SYNC
+from chgk_rating.data_loader import (
+    ResponseCache,
+    generate_synthetic_dataset,
+    is_aggregate_tournament,
+    normalize_tournament_format,
+)
+
+
+def test_response_cache(tmp_path: Path) -> None:
+    db_file = tmp_path / "test_cache.db"
+    cache = ResponseCache(db_file)
+
+    url = "https://api.rating.chgk.info/tournaments/12345"
+    data = {"id": 12345, "name": "Test Tournament"}
+
+    assert cache.get(url) is None
+    cache.set(url, 200, data)
+
+    cached_data = cache.get(url)
+    assert cached_data == data
+
+
+def test_tournament_format_normalization() -> None:
+    assert normalize_tournament_format("Очный", "Кубок Москвы") == FORMAT_OFFLINE
+    assert normalize_tournament_format("Синхрон", "Лига Сибири") == FORMAT_SYNC
+    assert normalize_tournament_format("Асинхрон", "Открытый турнир") == FORMAT_SYNC
+    assert normalize_tournament_format("Онлайн", "Турнир в Zoom") == FORMAT_ONLINE
+    assert normalize_tournament_format("Синхрон", "Онлайн-зеркало в дискорде") == FORMAT_ONLINE
+
+
+def test_aggregate_tournament_filtering() -> None:
+    assert is_aggregate_tournament("Общий зачёт", "Общий зачёт сезона") is True
+    assert is_aggregate_tournament("Сезон", "Студенческий сезон 2023") is True
+    assert is_aggregate_tournament("Рейтинг", "Сводная таблица") is True
+    assert is_aggregate_tournament("Очный", "Чемпионат Мира 2023") is False
+
+
+def test_synthetic_dataset_generation(tmp_path: Path) -> None:
+    pq_path = tmp_path / "test_synthetic.parquet"
+    df = generate_synthetic_dataset(
+        output_parquet_path=pq_path,
+        num_tournaments=3,
+        num_players=20,
+        num_teams=5,
+        questions_per_tournament=12,
+    )
+
+    assert pq_path.exists()
+    assert not df.empty
+    expected_cols = {
+        "tournament_id",
+        "tournament_type",
+        "date",
+        "team_id",
+        "player_ids",
+        "question_id",
+        "solved",
+    }
+    assert expected_cols.issubset(df.columns)
+
+    # Validate solved is 0 or 1
+    assert set(df["solved"].unique()).issubset({0, 1})
+
+    # Validate player rosters are lists of up to 6 players
+    for p_list in df["player_ids"]:
+        assert len(p_list) <= 6
+        assert len(p_list) > 0
