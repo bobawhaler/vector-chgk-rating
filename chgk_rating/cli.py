@@ -22,6 +22,7 @@ from chgk_rating.analytics import (
 )
 from chgk_rating.config import (
     DEFAULT_CACHE_DB_PATH,
+    DEFAULT_GQ_QUESTIONS_PARQUET,
     DEFAULT_META_PATH,
     DEFAULT_MODEL_PATH,
     DEFAULT_PARQUET_PATH,
@@ -430,6 +431,94 @@ def run_api_cmd(host: str, port: int) -> None:
     """Launch the FastAPI REST application using Uvicorn."""
     click.echo(f"Starting ChGK Rating REST API at http://{host}:{port} ...")
     uvicorn.run("chgk_rating.app:app", host=host, port=port, reload=False)
+
+
+@cli.command("update-rating")
+@click.option("--since-date", default=None, help="Sync tournaments edited since date (YYYY-MM-DD)")
+@click.option("--lookback-days", default=30, type=int, help="Lookback window in days if since-date not specified")
+@click.option("--data-path", default=str(DEFAULT_PARQUET_PATH), help="Path to Parquet dataset")
+def update_rating(since_date: Optional[str], lookback_days: int, data_path: str) -> None:
+    """Incrementally update dataset with newly created or edited tournaments on rating site."""
+    dest_parquet = Path(data_path)
+    ingest_config = DataIngestConfig(parquet_path=dest_parquet)
+    ingester = ChGKDataIngester(ingest_config)
+
+    def progress_callback(msg: str, current: int, total: int) -> None:
+        click.echo(f"[{current}/{total}] {msg}")
+
+    click.echo(f"Checking for updated tournaments on api.rating.chgk.info (lookback: {lookback_days} days)...")
+    df = asyncio.run(
+        ingester.update_incremental(
+            since_date=since_date,
+            lookback_days=lookback_days,
+            progress_cb=progress_callback,
+        )
+    )
+    click.echo(f"Incremental update complete! Total dataset records: {len(df)}")
+
+
+@cli.command("fetch-questions")
+@click.option("--lookback-packs", default=50, type=int, help="Recent packs to re-check during incremental crawl")
+@click.option("--max-packs", default=None, type=int, help="Max packs to fetch (None for all until 404 boundary)")
+@click.option("--rate-limit", default=2.0, type=float, help="Requests per second (polite default 2.0)")
+def fetch_questions(lookback_packs: int, max_packs: Optional[int], rate_limit: float) -> None:
+    """Politely fetch question packages, authors, and tour editors from gotquestions.online."""
+    from chgk_rating.config import GotQuestionsConfig
+    from chgk_rating.gotquestions import GotQuestionsIngester
+
+    cfg = GotQuestionsConfig(max_requests_per_second=rate_limit)
+    ingester = GotQuestionsIngester(cfg)
+
+    def progress_callback(msg: str, current: int, total: int) -> None:
+        click.echo(f"[{current}] {msg}")
+
+    click.echo(f"Starting polite gotquestions ingestion (rate limit: {rate_limit} req/s)...")
+    fetched = asyncio.run(
+        ingester.ingest_incremental(
+            lookback_packs=lookback_packs,
+            max_packs=max_packs,
+            progress_cb=progress_callback,
+        )
+    )
+    click.echo(f"Fetched {fetched} packs. Exporting to Parquet...")
+    q_df, p_df = ingester.export_to_parquet()
+    click.echo(
+        f"Export complete: {len(q_df)} questions across {len(p_df)} packages saved to {cfg.questions_parquet}"
+    )
+
+
+@cli.command("link-questions")
+@click.option("--data-path", default=str(DEFAULT_PARQUET_PATH), help="Path to rating dataset Parquet")
+@click.option("--questions-path", default=str(DEFAULT_GQ_QUESTIONS_PARQUET), help="Path to GotQuestions Parquet")
+def link_questions(data_path: str, questions_path: str) -> None:
+    """Analyze join coverage between rating observations and GotQuestions questions/authors."""
+    d_path = Path(data_path)
+    q_path = Path(questions_path)
+
+    if not d_path.exists():
+        click.echo(f"Rating dataset not found at {d_path}", err=True)
+        return
+    if not q_path.exists():
+        click.echo(
+            f"GotQuestions dataset not found at {q_path}. Run 'fetch-questions' first.", err=True
+        )
+        return
+
+    df_rating = pd.read_parquet(d_path)
+    df_gq = pd.read_parquet(q_path)
+
+    total_rating_q = df_rating["question_id"].nunique()
+    gq_linked = df_gq[df_gq["rating_tournament_id"] > 0]
+    total_gq_q = gq_linked["question_id"].nunique()
+
+    common_q = set(df_rating["question_id"]).intersection(set(gq_linked["question_id"]))
+    coverage = len(common_q) / max(total_rating_q, 1) * 100.0
+
+    click.echo("================ Question Linkage Analysis ================")
+    click.echo(f"Unique questions in rating dataset:         {total_rating_q}")
+    click.echo(f"Unique linked questions from GotQuestions:   {total_gq_q}")
+    click.echo(f"Matched questions with text & authors:      {len(common_q)} ({coverage:.2f}% coverage)")
+    click.echo("===========================================================")
 
 
 if __name__ == "__main__":

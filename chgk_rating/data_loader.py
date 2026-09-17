@@ -63,6 +63,15 @@ class ResponseCache:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sync_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
             conn.commit()
 
     def get(self, url: str) -> Optional[Any]:
@@ -76,6 +85,26 @@ class ResponseCache:
                 except json.JSONDecodeError:
                     return None
         return None
+
+    def invalidate(self, url: str) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM api_cache WHERE url = ?", (url,))
+            conn.commit()
+
+    def get_sync_state(self, key: str) -> Optional[str]:
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT value FROM sync_state WHERE key = ?", (key,))
+            row = cursor.fetchone()
+            return row[0] if row else None
+
+    def set_sync_state(self, key: str, value: str) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO sync_state (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+                (key, value),
+            )
+            conn.commit()
 
     def set(self, url: str, status_code: int, data: Any) -> None:
         with sqlite3.connect(self.db_path) as conn:
@@ -218,14 +247,18 @@ class ChGKDataIngester:
         client: httpx.AsyncClient,
         start_date: str = "2020-01-01",
         end_date: Optional[str] = None,
+        last_edit_after: Optional[str] = None,
         max_tournaments: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
-        """Fetch list of valid non-aggregate tournaments starting from date."""
+        """Fetch list of valid non-aggregate tournaments starting from date or edited since date."""
         tournaments: List[Dict[str, Any]] = []
         page = 1
-        query_suffix = f"&dateStart[after]={start_date}"
-        if end_date:
-            query_suffix += f"&dateEnd[before]={end_date}"
+        if last_edit_after:
+            query_suffix = f"&lastEditDate[after]={last_edit_after}"
+        else:
+            query_suffix = f"&dateStart[after]={start_date}"
+            if end_date:
+                query_suffix += f"&dateEnd[before]={end_date}"
 
         while True:
             if max_tournaments is not None and len(tournaments) >= max_tournaments:
@@ -435,10 +468,141 @@ class ChGKDataIngester:
 
             writer.close()
             logger.info("Saved %d total records into %s", total_saved_records, self.config.parquet_path)
+            self.cache.set_sync_state("rating_last_sync", datetime.now().isoformat())
 
             if total_saved_records > 0:
                 return pd.read_parquet(self.config.parquet_path)
             return pd.DataFrame()
+
+    async def update_incremental(
+        self,
+        since_date: Optional[str] = None,
+        lookback_days: int = 30,
+        progress_cb: Optional[Callable[[str, int, int], None]] = None,
+    ) -> pd.DataFrame:
+        """Incrementally update dataset with tournaments created or edited recently."""
+        if since_date is None:
+            last_sync = self.cache.get_sync_state("rating_last_sync")
+            if last_sync:
+                try:
+                    dt = datetime.fromisoformat(last_sync[:10]) - timedelta(days=lookback_days)
+                    since_date = dt.strftime("%Y-%m-%d")
+                except ValueError:
+                    since_date = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+            else:
+                since_date = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+
+        logger.info("Checking for edited tournaments on rating site since %s...", since_date)
+
+        async with httpx.AsyncClient() as client:
+            updated_tournaments = await self.fetch_tournaments(
+                client,
+                last_edit_after=since_date,
+            )
+
+            if not updated_tournaments:
+                logger.info("No tournaments were updated since %s.", since_date)
+                self.cache.set_sync_state("rating_last_sync", datetime.now().isoformat())
+                if self.config.parquet_path.exists():
+                    return pd.read_parquet(self.config.parquet_path)
+                return pd.DataFrame()
+
+            logger.info("Found %d edited/new tournaments to sync.", len(updated_tournaments))
+            updated_t_ids = {int(t["id"]) for t in updated_tournaments if t.get("id")}
+
+            # Invalidate cached results for these updated tournaments so fresh results are fetched
+            for t_id in updated_t_ids:
+                res_url = f"{self.config.api_base_url}/tournaments/{t_id}/results?includeMasksAndControversials=1&includeTeamMembers=1"
+                self.cache.invalidate(res_url)
+
+            # Ingest records for the updated tournaments
+            sem = asyncio.Semaphore(10)
+            new_records: List[Dict[str, Any]] = []
+            completed = 0
+            total_t = len(updated_tournaments)
+
+            async def process_one(t: Dict[str, Any]) -> List[Dict[str, Any]]:
+                nonlocal completed
+                t_id = int(t["id"])
+                t_fmt = t.get("format") or normalize_tournament_format(
+                    t.get("type", {}).get("name", "") if isinstance(t.get("type"), dict) else str(t.get("type", "")),
+                    t.get("name", ""),
+                )
+                t_date = (t.get("dateStart") or "2020-01-01")[:10]
+                async with sem:
+                    results = await self.fetch_tournament_results(client, t_id)
+                t_recs = []
+                for res in results:
+                    team_obj = res.get("team", {})
+                    team_id = team_obj.get("id") or res.get("idTeam")
+                    if not team_id:
+                        continue
+                    team_id = int(team_id)
+                    members = res.get("teamMembers") or []
+                    players = [
+                        int(m["player"]["id"])
+                        for m in members
+                        if isinstance(m, dict) and m.get("player") and m["player"].get("id")
+                    ]
+                    if not players:
+                        continue
+                    mask_str = res.get("mask", "")
+                    if not mask_str:
+                        tours = res.get("tours", [])
+                        mask_str = "".join(
+                            tour.get("mask", "") for tour in tours if isinstance(tour, dict)
+                        )
+                    if not mask_str:
+                        continue
+                    q_idx = 0
+                    for char in mask_str:
+                        if char in ("X", "x", "?"):
+                            continue
+                        elif char in ("0", "1"):
+                            q_idx += 1
+                            t_recs.append({
+                                "tournament_id": t_id,
+                                "tournament_type": t_fmt,
+                                "date": t_date,
+                                "team_id": team_id,
+                                "player_ids": players[:6],
+                                "question_id": f"{t_id}_{q_idx}",
+                                "solved": int(char),
+                            })
+                completed += 1
+                if progress_cb and (completed % 10 == 0 or completed == total_t):
+                    progress_cb(f"Updated tournament {t_id}", completed, total_t)
+                return t_recs
+
+            tasks = [process_one(t) for t in updated_tournaments]
+            results_nested = await asyncio.gather(*tasks)
+            for rlist in results_nested:
+                new_records.extend(rlist)
+
+            # Merge with existing parquet dataset
+            if self.config.parquet_path.exists():
+                existing_df = pd.read_parquet(self.config.parquet_path)
+                kept_df = existing_df[~existing_df["tournament_id"].isin(updated_t_ids)]
+                if new_records:
+                    new_df = pd.DataFrame(new_records)
+                    merged_df = pd.concat([kept_df, new_df], ignore_index=True)
+                else:
+                    merged_df = kept_df
+            else:
+                merged_df = pd.DataFrame(new_records)
+
+            if not merged_df.empty:
+                merged_df = merged_df.sort_values(by=["date", "tournament_id"]).reset_index(drop=True)
+                merged_df.to_parquet(self.config.parquet_path, index=False)
+                logger.info(
+                    "Updated dataset at %s: total records now %d (updated %d tournaments)",
+                    self.config.parquet_path,
+                    len(merged_df),
+                    len(updated_tournaments),
+                )
+
+            self.cache.set_sync_state("rating_last_sync", datetime.now().isoformat())
+            return merged_df
 
 
 def generate_synthetic_dataset(
