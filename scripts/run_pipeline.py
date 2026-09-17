@@ -132,14 +132,19 @@ async def main() -> None:
     # 4. Format Similarity Analysis
     logger.info("=== Format Similarity & Baseline Biases ===")
     format_info = get_format_analysis(model, metadata)
-    for fmt_name, data in format_info.get("formats", {}).items():
+    for fmt_item in format_info.get("formats", []):
         logger.info(
             "Format '%s': Bias = %.4f, Norm = %.4f",
-            fmt_name,
-            data.get("bias", 0.0),
-            data.get("norm", 0.0),
+            fmt_item.get("format_name"),
+            fmt_item.get("baseline_bias", 0.0),
+            fmt_item.get("embedding_norm", 0.0),
         )
-    logger.info("Format Cosine Similarities: %s", format_info.get("cosine_similarities", {}))
+    names = format_info.get("format_names", [])
+    sim_mat = format_info.get("cosine_similarity_matrix", [])
+    for i, name1 in enumerate(names):
+        for j, name2 in enumerate(names):
+            if i < j and i < len(sim_mat) and j < len(sim_mat[i]):
+                logger.info("Format similarity '%s' vs '%s': %.4f", name1, name2, sim_mat[i][j])
 
     total_pipeline_time = time.time() - start_time
     logger.info(
