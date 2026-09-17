@@ -30,36 +30,22 @@ logger = logging.getLogger(__name__)
 
 def extract_pack_from_rsc(text: str) -> Optional[Dict[str, Any]]:
     """Extract the structured pack dict from a React Server Component (RSC) response stream."""
+    if "NEXT_HTTP_ERROR_FALLBACK;404" in text:
+        return None
     decoder = json.JSONDecoder()
-    for line in text.splitlines():
-        if '"pack":{' in line:
-            pos = 0
-            while pos < len(line):
-                idx = line.find('{"pack":', pos)
-                if idx == -1:
-                    # Try looking for general '{' near pack
-                    idx = line.find('"pack":{', pos)
-                    if idx != -1:
-                        # Backtrack to the opening brace
-                        brace_idx = line.rfind("{", 0, idx)
-                        if brace_idx != -1:
-                            idx = brace_idx
-                        else:
-                            break
-                    else:
-                        break
-                try:
-                    obj, _ = decoder.raw_decode(line, idx)
-                    if isinstance(obj, dict):
-                        if "pack" in obj and isinstance(obj["pack"], dict):
-                            return obj["pack"]
-                        # Recursively search if nested
-                        res = _find_pack_in_obj(obj)
-                        if res is not None:
-                            return res
-                    pos = idx + 8
-                except Exception:
-                    pos = idx + 1
+    pos = 0
+    target = '"pack":{'
+    while pos < len(text):
+        idx = text.find(target, pos)
+        if idx == -1:
+            break
+        try:
+            obj, _ = decoder.raw_decode(text, idx + len('"pack":'))
+            if isinstance(obj, dict) and "id" in obj:
+                return obj
+        except Exception:
+            pass
+        pos = idx + len(target)
     return None
 
 

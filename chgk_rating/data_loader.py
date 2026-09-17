@@ -152,16 +152,23 @@ class AsyncRateLimiter:
 
     def __init__(self, max_per_second: float = 10.0) -> None:
         self.interval = 1.0 / max(max_per_second, 1.0)
-        self.lock = asyncio.Lock()
+        self._lock: Optional[asyncio.Lock] = None
         self.last_request_time: float = 0.0
+
+    @property
+    def lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     async def acquire(self) -> None:
         async with self.lock:
-            now = asyncio.get_event_loop().time()
+            loop = asyncio.get_running_loop()
+            now = loop.time()
             elapsed = now - self.last_request_time
             if elapsed < self.interval:
                 await asyncio.sleep(self.interval - elapsed)
-            self.last_request_time = asyncio.get_event_loop().time()
+            self.last_request_time = loop.time()
 
 
 def normalize_tournament_format(type_name: str, title: str) -> str:
