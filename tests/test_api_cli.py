@@ -125,15 +125,18 @@ def test_cli_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
     # 2. Test train
     model_path = tmp_path / "cli_model.pt"
+    meta_path = tmp_path / "cli_meta.json"
     res = runner.invoke(
         cli,
         [
             "train",
             "--data-path", str(pq_path),
             "--model-path", str(model_path),
+            "--meta-path", str(meta_path),
             "--epochs", "2",
             "--batch-size", "128",
         ],
     )
     assert res.exit_code == 0
     assert model_path.exists()
+    assert meta_path.exists()

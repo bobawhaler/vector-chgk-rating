@@ -116,6 +116,7 @@ def fetch_data(
 @click.option("--device", default="auto", help="Execution device: auto, cpu, or mps")
 @click.option("--data-path", default=str(DEFAULT_PARQUET_PATH), help="Path to Parquet dataset")
 @click.option("--model-path", default=str(DEFAULT_MODEL_PATH), help="Path to save best model")
+@click.option("--meta-path", default=str(DEFAULT_META_PATH), help="Path to save dataset metadata")
 def train(
     dim_k: int,
     dim_c: int,
@@ -126,6 +127,7 @@ def train(
     device: str,
     data_path: str,
     model_path: str,
+    meta_path: str,
 ) -> None:
     """Train the Dual Latent Embedding Rating Model."""
     parquet_p = Path(data_path)
@@ -155,6 +157,7 @@ def train(
         config=cfg,
         parquet_path=parquet_p,
         model_save_path=Path(model_path),
+        meta_save_path=Path(meta_path),
     )
 
     click.echo("Training Complete!")
