@@ -164,6 +164,7 @@ class ChGKDataset(Dataset):
             if "date" in sorted_df.columns
             else ["2023-01-01"] * len(sorted_df)
         )
+        player_id_lists = sorted_df["player_ids"].tolist()
         total_rows = len(sorted_df)
         rosters_arr = np.zeros((total_rows, max_players_per_team), dtype=np.int64)
         question_ids_arr = np.zeros(total_rows, dtype=np.int64)
