@@ -148,20 +148,35 @@ class ChGKDataset(Dataset):
         running_player_last: Dict[str, datetime] = {}
         running_pair_last: Dict[str, datetime] = {}
 
-        for _, row in sorted_df.iterrows():
-            q_id_raw = str(row["question_id"])
+        q_ids = sorted_df["question_id"].astype(str).tolist()
+        fmt_strs = (
+            sorted_df["tournament_type"]
+            .fillna(FORMAT_OFFLINE)
+            .astype(str)
+            .str.lower()
+            .tolist()
+            if "tournament_type" in sorted_df.columns
+            else [FORMAT_OFFLINE] * len(sorted_df)
+        )
+        solved_vals = sorted_df["solved"].astype(float).tolist()
+        date_strs = (
+            sorted_df["date"].astype(str).tolist()
+            if "date" in sorted_df.columns
+            else ["2023-01-01"] * len(sorted_df)
+        )
+        player_id_lists = sorted_df["player_ids"].tolist()
+
+        for q_id_raw, fmt_str, solved_val, curr_date_str, raw_players in zip(
+            q_ids, fmt_strs, solved_vals, date_strs, player_id_lists
+        ):
             if q_id_raw not in q_idxer.item_to_idx:
                 continue
 
             q_idx = q_idxer.get_idx(q_id_raw)
-            fmt_str = str(row.get("tournament_type", FORMAT_OFFLINE)).lower()
             fmt_id = fmt_map.get(fmt_str, 0)
-            solved_val = float(row["solved"])
-            curr_date = parse_date(row.get("date", "2023-01-01"))
-            curr_date_str = curr_date.strftime("%Y-%m-%d")
+            curr_date = parse_date(curr_date_str)
 
             # Extract raw players
-            raw_players = row["player_ids"]
             if isinstance(raw_players, np.ndarray):
                 raw_players = raw_players.tolist()
             elif not isinstance(raw_players, list):

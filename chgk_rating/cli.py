@@ -10,6 +10,7 @@ from typing import Optional
 
 import click
 import pandas as pd
+import torch
 import uvicorn
 
 from chgk_rating.analytics import (
@@ -49,8 +50,9 @@ def cli() -> None:
 
 
 @cli.command("fetch-data")
-@click.option("--start-date", default="2023-01-01", help="Start date for tournaments (YYYY-MM-DD)")
-@click.option("--max-tournaments", default=30, type=int, help="Max tournaments to fetch")
+@click.option("--start-date", default="2020-01-01", help="Start date for tournaments (YYYY-MM-DD)")
+@click.option("--end-date", default=None, help="End date for tournaments (YYYY-MM-DD)")
+@click.option("--max-tournaments", default=None, type=int, help="Max tournaments to fetch (None for all)")
 @click.option(
     "--synthetic",
     is_flag=True,
@@ -63,7 +65,11 @@ def cli() -> None:
     help="Destination path for Parquet dataset",
 )
 def fetch_data(
-    start_date: str, max_tournaments: int, synthetic: bool, output_path: str
+    start_date: str,
+    end_date: Optional[str],
+    max_tournaments: Optional[int],
+    synthetic: bool,
+    output_path: str,
 ) -> None:
     """Fetch tournament results from ChGK rating API or generate synthetic dataset."""
     dest_parquet = Path(output_path)
@@ -84,7 +90,8 @@ def fetch_data(
         df = asyncio.run(
             ingester.ingest_dataset(
                 start_date=start_date,
-                max_tournaments=max_tournaments,
+                end_date=end_date,
+                max_tournaments=max_tournaments if (max_tournaments and max_tournaments > 0) else None,
                 progress_cb=progress_callback,
             )
         )
@@ -106,6 +113,7 @@ def fetch_data(
 @click.option("--batch-size", default=4096, type=int, help="Training batch size")
 @click.option("--lr", default=1e-3, type=float, help="Learning rate for AdamW")
 @click.option("--weight-decay", default=1e-4, type=float, help="L2 regularization")
+@click.option("--device", default="auto", help="Execution device: auto, cpu, or mps")
 @click.option("--data-path", default=str(DEFAULT_PARQUET_PATH), help="Path to Parquet dataset")
 @click.option("--model-path", default=str(DEFAULT_MODEL_PATH), help="Path to save best model")
 def train(
@@ -115,6 +123,7 @@ def train(
     batch_size: int,
     lr: float,
     weight_decay: float,
+    device: str,
     data_path: str,
     model_path: str,
 ) -> None:
@@ -124,6 +133,10 @@ def train(
         click.echo(f"Dataset not found at {parquet_p}. Generating synthetic dataset first...")
         generate_synthetic_dataset(output_parquet_path=parquet_p)
 
+    target_device = device
+    if device == "auto":
+        target_device = "mps" if torch.backends.mps.is_available() else "cpu"
+
     cfg = ModelConfig(
         dim_k=dim_k,
         dim_c=dim_c,
@@ -131,9 +144,13 @@ def train(
         batch_size=batch_size,
         learning_rate=lr,
         weight_decay=weight_decay,
+        device=target_device,
     )
 
-    click.echo(f"Starting training for {epochs} epochs (D={dim_k}, M={dim_c}, Batch={batch_size})...")
+    click.echo(
+        f"Starting training on {target_device} for {epochs} epochs "
+        f"(D={dim_k}, M={dim_c}, Batch={batch_size})..."
+    )
     model, metadata, results = train_model(
         config=cfg,
         parquet_path=parquet_p,

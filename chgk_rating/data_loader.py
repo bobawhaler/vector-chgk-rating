@@ -216,14 +216,21 @@ class ChGKDataIngester:
     async def fetch_tournaments(
         self,
         client: httpx.AsyncClient,
-        start_date: str = "2023-01-01",
-        max_tournaments: int = 50,
+        start_date: str = "2020-01-01",
+        end_date: Optional[str] = None,
+        max_tournaments: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Fetch list of valid non-aggregate tournaments starting from date."""
         tournaments: List[Dict[str, Any]] = []
         page = 1
-        while len(tournaments) < max_tournaments:
-            url = f"{self.config.api_base_url}/tournaments?page={page}&itemsPerPage=50&dateStart[after]={start_date}"
+        query_suffix = f"&dateStart[after]={start_date}"
+        if end_date:
+            query_suffix += f"&dateEnd[before]={end_date}"
+
+        while True:
+            if max_tournaments is not None and len(tournaments) >= max_tournaments:
+                break
+            url = f"{self.config.api_base_url}/tournaments?page={page}&itemsPerPage=50{query_suffix}"
             data = await self._get_json(client, url)
             if not data:
                 break
@@ -252,7 +259,7 @@ class ChGKDataIngester:
                     "dateEnd": date_end,
                 })
                 self.cache.save_tournament_meta(t_id, title, fmt, date_start, date_end, t)
-                if len(tournaments) >= max_tournaments:
+                if max_tournaments is not None and len(tournaments) >= max_tournaments:
                     break
             page += 1
         return tournaments
@@ -287,8 +294,8 @@ class ChGKDataIngester:
     async def fetch_tournament_results(
         self, client: httpx.AsyncClient, tournament_id: int
     ) -> List[Dict[str, Any]]:
-        """Fetch question results/masks for all teams in a tournament."""
-        url = f"{self.config.api_base_url}/tournaments/{tournament_id}/results"
+        """Fetch question results/masks with team members for all teams in a tournament."""
+        url = f"{self.config.api_base_url}/tournaments/{tournament_id}/results?includeMasksAndControversials=1&includeTeamMembers=1"
         data = await self._get_json(client, url)
         if not data:
             return []
@@ -297,29 +304,54 @@ class ChGKDataIngester:
 
     async def ingest_dataset(
         self,
-        start_date: str = "2023-01-01",
-        max_tournaments: int = 50,
+        start_date: str = "2020-01-01",
+        end_date: Optional[str] = None,
+        max_tournaments: Optional[int] = None,
         progress_cb: Optional[Callable[[str, int, int], None]] = None,
     ) -> pd.DataFrame:
         """Run complete async ingestion and compile into Parquet format."""
+        if end_date is None:
+            end_date = datetime.now().strftime("%Y-%m-%d")
+
         async with httpx.AsyncClient() as client:
             tournaments = await self.fetch_tournaments(
-                client, start_date=start_date, max_tournaments=max_tournaments
+                client,
+                start_date=start_date,
+                end_date=end_date,
+                max_tournaments=max_tournaments,
             )
             logger.info("Found %d valid tournaments to process", len(tournaments))
-
-            all_records: List[Dict[str, Any]] = []
             total_t = len(tournaments)
 
-            for idx, t in enumerate(tournaments, 1):
+            schema = pa.schema([
+                ("tournament_id", pa.int64()),
+                ("tournament_type", pa.string()),
+                ("date", pa.string()),
+                ("team_id", pa.int64()),
+                ("player_ids", pa.list_(pa.int64())),
+                ("question_id", pa.string()),
+                ("solved", pa.int8()),
+            ])
+
+            self.config.parquet_path.parent.mkdir(parents=True, exist_ok=True)
+            writer = pq.ParquetWriter(self.config.parquet_path, schema)
+
+            sem = asyncio.Semaphore(10)
+            completed_count = 0
+            records_buffer: List[Dict[str, Any]] = []
+            total_saved_records = 0
+
+            async def process_tournament(idx: int, t: Dict[str, Any]) -> List[Dict[str, Any]]:
+                nonlocal completed_count
                 t_id = t["id"]
                 t_fmt = t["format"]
-                t_date = (t["dateStart"] or "2023-01-01")[:10]
-                if progress_cb:
-                    progress_cb(f"Fetching tournament {t_id} ({t['name'][:25]}...)", idx, total_t)
+                t_date = (t["dateStart"] or "2020-01-01")[:10]
 
-                rosters = await self.fetch_tournament_rosters(client, t_id)
-                results = await self.fetch_tournament_results(client, t_id)
+                async with sem:
+                    results = await self.fetch_tournament_results(client, t_id)
+
+                t_records: List[Dict[str, Any]] = []
+                rosters: Optional[Dict[int, List[int]]] = None
 
                 for res in results:
                     team_obj = res.get("team", {})
@@ -327,15 +359,23 @@ class ChGKDataIngester:
                     if not team_id:
                         continue
                     team_id = int(team_id)
-                    players = rosters.get(team_id, [])
+
+                    # Extract player IDs directly from teamMembers if available
+                    members = res.get("teamMembers") or []
+                    players = [
+                        int(m["player"]["id"])
+                        for m in members
+                        if isinstance(m, dict) and m.get("player") and m["player"].get("id")
+                    ]
                     if not players:
                         continue
 
                     mask_str = res.get("mask", "")
                     if not mask_str:
-                        # Sometimes masks are grouped in tours
                         tours = res.get("tours", [])
-                        mask_str = "".join(tour.get("mask", "") for tour in tours if isinstance(tour, dict))
+                        mask_str = "".join(
+                            tour.get("mask", "") for tour in tours if isinstance(tour, dict)
+                        )
 
                     if not mask_str:
                         continue
@@ -344,26 +384,61 @@ class ChGKDataIngester:
                     q_idx = 0
                     for char in mask_str:
                         if char in ("X", "x", "?"):
-                            # Cancelled or voided question
                             continue
                         elif char in ("0", "1"):
                             q_idx += 1
                             question_id = f"{t_id}_{q_idx}"
-                            all_records.append({
+                            t_records.append({
                                 "tournament_id": t_id,
                                 "tournament_type": t_fmt,
                                 "date": t_date,
                                 "team_id": team_id,
-                                "player_ids": players[:6],  # Standard team size up to 6
+                                "player_ids": players[:6],
                                 "question_id": question_id,
                                 "solved": int(char),
                             })
 
-            df = pd.DataFrame(all_records)
-            if not df.empty:
-                self.config.parquet_path.parent.mkdir(parents=True, exist_ok=True)
-                df.to_parquet(self.config.parquet_path, index=False)
-            return df
+                completed_count += 1
+                if progress_cb and (completed_count % 10 == 0 or completed_count == total_t):
+                    progress_cb(
+                        f"Fetched tournament {t_id} ({t['name'][:25]}...)",
+                        completed_count,
+                        total_t,
+                    )
+                return t_records
+
+            # Process tournaments in concurrent chunks
+            chunk_size = 50
+            for i in range(0, total_t, chunk_size):
+                chunk = tournaments[i : i + chunk_size]
+                tasks = [process_tournament(i + j + 1, t) for j, t in enumerate(chunk)]
+                results_list = await asyncio.gather(*tasks)
+
+                for r_list in results_list:
+                    records_buffer.extend(r_list)
+
+                # Write out chunk if buffer has accumulated sufficient rows
+                if len(records_buffer) >= 20000:
+                    batch_df = pd.DataFrame(records_buffer)
+                    table = pa.Table.from_pandas(batch_df, schema=schema, preserve_index=False)
+                    writer.write_table(table)
+                    total_saved_records += len(records_buffer)
+                    records_buffer.clear()
+
+            # Flush remaining records
+            if records_buffer:
+                batch_df = pd.DataFrame(records_buffer)
+                table = pa.Table.from_pandas(batch_df, schema=schema, preserve_index=False)
+                writer.write_table(table)
+                total_saved_records += len(records_buffer)
+                records_buffer.clear()
+
+            writer.close()
+            logger.info("Saved %d total records into %s", total_saved_records, self.config.parquet_path)
+
+            if total_saved_records > 0:
+                return pd.read_parquet(self.config.parquet_path)
+            return pd.DataFrame()
 
 
 def generate_synthetic_dataset(
