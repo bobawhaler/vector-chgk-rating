@@ -42,7 +42,7 @@ def load_model_and_metadata(
         dim_c=cfg.get("dim_c", 8),
         num_formats=cfg.get("num_formats", 3),
     )
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model.load_state_dict(checkpoint["model_state_dict"], strict=False)
     model.to(device)
     model.eval()
     return model, metadata
@@ -399,4 +399,49 @@ def export_embeddings_to_parquet(
         "player_csv": p_csv,
         "question_parquet": q_parquet,
         "question_csv": q_csv,
+    }
+
+
+def get_format_analysis(
+    model: DualEmbeddingChGKModel,
+    metadata: DatasetMetadata,
+) -> Dict[str, Any]:
+    """Inspect learned relationships, baseline shifts, and geometric similarities among tournament types."""
+    from chgk_rating.config import ID_TO_FORMAT
+
+    with torch.no_grad():
+        f_embs = model.format_emb.weight.cpu().numpy()  # (num_formats, M)
+        f_biases = model.format_bias.weight.cpu().numpy().squeeze(-1)  # (num_formats,)
+
+    formats: List[Dict[str, Any]] = []
+    num_f = len(f_embs)
+
+    for f_id in range(num_f):
+        f_name = ID_TO_FORMAT.get(f_id, f"format_{f_id}")
+        vec = f_embs[f_id]
+        bias = float(f_biases[f_id])
+        norm = float(np.linalg.norm(vec))
+
+        formats.append({
+            "format_id": f_id,
+            "format_name": f_name,
+            "baseline_bias": round(bias, 4),
+            "embedding_norm": round(norm, 4),
+        })
+
+    # Compute pairwise similarities
+    pairwise_matrix: List[List[float]] = []
+    for i in range(num_f):
+        row: List[float] = []
+        norm_i = max(np.linalg.norm(f_embs[i]), 1e-7)
+        for j in range(num_f):
+            norm_j = max(np.linalg.norm(f_embs[j]), 1e-7)
+            cos_sim = float(np.dot(f_embs[i], f_embs[j]) / (norm_i * norm_j))
+            row.append(round(cos_sim, 4))
+        pairwise_matrix.append(row)
+
+    return {
+        "formats": formats,
+        "format_names": [ID_TO_FORMAT.get(i, str(i)) for i in range(num_f)],
+        "cosine_similarity_matrix": pairwise_matrix,
     }

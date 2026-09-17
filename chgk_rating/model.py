@@ -82,6 +82,10 @@ class DualEmbeddingChGKModel(nn.Module):
         self.format_emb = nn.Embedding(num_formats, dim_c)
         nn.init.normal_(self.format_emb.weight, mean=0.0, std=0.1)
 
+        # Global format baseline bias (e.g. format difficulty / environment baseline shift)
+        self.format_bias = nn.Embedding(num_formats, 1)
+        nn.init.zeros_(self.format_bias.weight)
+
         # Synergy Interaction Tensor: W_synergy in R^(M x M)
         self.W_synergy = nn.Parameter(torch.empty(dim_c, dim_c))
         nn.init.xavier_normal_(self.W_synergy, gain=0.1)
@@ -262,8 +266,9 @@ class DualEmbeddingChGKModel(nn.Module):
             z_anomaly = is_online * factual_factor * self.online_anomaly_weight
 
         # 5. Final Solved Probability:
-        # P_final = sigmoid(logit(P_gen) + S_team + z_anomaly) = sigmoid(z_know + S_team + z_anomaly)
-        z_final = z_know + s_team + z_anomaly
+        # P_final = sigmoid(logit(P_gen) + S_team + b_f + z_anomaly)
+        b_f = self.format_bias(format_ids)  # (B, 1)
+        z_final = z_know + s_team + b_f + z_anomaly
         p_final = torch.sigmoid(z_final)
 
         return {
@@ -272,6 +277,7 @@ class DualEmbeddingChGKModel(nn.Module):
             "p_gen": p_gen,
             "z_know": z_know,
             "s_team": s_team,
+            "b_format": b_f,
             "z_anomaly": z_anomaly,
             "k_team": k_team,
         }

@@ -319,6 +319,34 @@ def player_timeline_cmd(player_id: str, start_date: str, end_date: str, step_day
         )
 
 
+@cli.command("format-analysis")
+def format_analysis_cmd() -> None:
+    """Inspect learned relationships, baseline shifts, and geometric similarities among tournament types."""
+    if not DEFAULT_MODEL_PATH.exists() or not DEFAULT_META_PATH.exists():
+        click.echo("Trained model not found. Run train first.", err=True)
+        sys.exit(1)
+
+    from chgk_rating.analytics import get_format_analysis
+    model, metadata = load_model_and_metadata(DEFAULT_MODEL_PATH, DEFAULT_META_PATH)
+    analysis = get_format_analysis(model, metadata)
+
+    click.echo("================ Learned Tournament Format Analysis ================")
+    click.echo(f"{'Format Name':<12} {'Format ID':<10} {'Baseline Bias':<15} {'Embedding Norm':<15}")
+    click.echo("-" * 55)
+    for f in analysis["formats"]:
+        click.echo(f"{f['format_name']:<12} {f['format_id']:<10} {f['baseline_bias']:<15.4f} {f['embedding_norm']:<15.4f}")
+
+    click.echo("\n--- Pairwise Format Cosine Similarities ---")
+    names = analysis["format_names"]
+    header = f"{'':<12}" + "".join(f"{n:<12}" for n in names)
+    click.echo(header)
+    click.echo("-" * len(header))
+    for i, row in enumerate(analysis["cosine_similarity_matrix"]):
+        row_str = f"{names[i]:<12}" + "".join(f"{val:<12.4f}" for val in row)
+        click.echo(row_str)
+    click.echo("====================================================================")
+
+
 @cli.command("top-players")
 @click.option("--n", default=15, type=int, help="Number of top players to list")
 def top_players_cmd(n: int) -> None:
