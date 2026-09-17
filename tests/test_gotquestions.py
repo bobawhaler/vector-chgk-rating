@@ -173,3 +173,31 @@ async def test_ingest_incremental_mocked(tmp_path: Path) -> None:
         assert ingester.cache.is_known_not_found(3) is True
         assert ingester.cache.is_known_not_found(4) is True
         assert ingester.cache.is_known_not_found(5) is True
+
+
+@pytest.mark.anyio
+async def test_ingest_incremental_blocked_stop(tmp_path: Path) -> None:
+    db_path = tmp_path / "gq_blocked.db"
+    config = GotQuestionsConfig(
+        cache_db_path=db_path,
+        max_requests_per_second=100.0,
+    )
+    ingester = GotQuestionsIngester(config)
+
+    # Pack 1 returns 200, pack 2 returns 429
+    async def mock_get(url: str, **kwargs):
+        pack_id = int(str(url).split("/")[-1])
+        if pack_id == 1:
+            content = '1:{"pack":' + json.dumps({"id": 1, "title": "Pack 1", "tIds": []}) + "}\n"
+            return httpx.Response(200, text=content, request=httpx.Request("GET", url))
+        else:
+            return httpx.Response(429, request=httpx.Request("GET", url))
+
+    with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_client_get:
+        mock_client_get.side_effect = mock_get
+        fetched = await ingester.ingest_incremental(lookback_packs=0)
+
+        # Halted on pack 2, pack 1 safely saved
+        assert fetched == 1
+        assert ingester.cache.get_saved_pack_count() == 1
+        assert ingester.cache.get_pack(1) is not None

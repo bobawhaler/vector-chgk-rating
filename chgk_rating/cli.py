@@ -461,8 +461,8 @@ def update_rating(since_date: Optional[str], lookback_days: int, data_path: str)
 @click.option("--lookback-packs", default=50, type=int, help="Recent packs to re-check during incremental crawl")
 @click.option("--max-packs", default=None, type=int, help="Max packs to fetch (None for all until boundary)")
 @click.option("--target-max-pack", default=7125, type=int, help="Known upper bound pack ID on gotquestions")
-@click.option("--rate-limit", default=2.0, type=float, help="Requests per second (polite default 2.0)")
-@click.option("--concurrency", default=2, type=int, help="Concurrent workers (default 2)")
+@click.option("--rate-limit", default=1.0, type=float, help="Requests per second (gentle default 1.0)")
+@click.option("--concurrency", default=1, type=int, help="Concurrent workers (gentle default 1)")
 def fetch_questions(
     lookback_packs: int,
     max_packs: Optional[int],

@@ -74,7 +74,7 @@ class GotQuestionsConfig:
     cache_db_path: Path = DEFAULT_GQ_CACHE_DB_PATH
     questions_parquet: Path = DEFAULT_GQ_QUESTIONS_PARQUET
     packs_parquet: Path = DEFAULT_GQ_PACKS_PARQUET
-    max_requests_per_second: float = 2.0  # Polite rate limit to never overload community server
+    max_requests_per_second: float = 1.0  # Gentle 1 req/s to prevent fail2ban / rate-limits
     timeout_seconds: float = 15.0
     max_retries: int = 4
     consecutive_404_stop: int = 30  # Stop scanning when N consecutive packs return 404
