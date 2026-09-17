@@ -29,3 +29,7 @@ dev = [
 
 [project.scripts]
 chgk-rating = "chgk_rating.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["chgk_rating*"]
