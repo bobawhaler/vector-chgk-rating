@@ -249,16 +249,19 @@ def train_model(
     model.load_state_dict(checkpoint["model_state_dict"])
     test_metrics = evaluate_model(model, test_loader, device)
 
+    calib_summary = model.time_decay.get_calibration_summary()
     logger.info(
-        "Final Test Evaluation: LogLoss: %.4f | ROC-AUC: %.4f | Brier: %.4f",
-        test_metrics["log_loss"],
-        test_metrics["roc_auc"],
-        test_metrics["brier_score"],
+        "Learned Temporal Calibration: Grace Period: %s d | Fact Half-Life: %s d | Logic Half-Life: %s d | Synergy Half-Life: %s d",
+        calib_summary["learned_grace_period_days"],
+        calib_summary["factual_half_life_days"],
+        calib_summary["logical_half_life_days"],
+        calib_summary["synergy_half_life_days"],
     )
 
     results = {
         "best_val_metrics": best_metrics,
         "test_metrics": test_metrics,
+        "calibration": calib_summary,
         "epochs_trained": cfg.epochs,
         "total_train_samples": len(train_dataset),
         "total_test_samples": len(test_dataset),

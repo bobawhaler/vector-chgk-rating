@@ -145,6 +145,14 @@ def train(
     click.echo(f"Test LogLoss:     {results['test_metrics']['log_loss']:.4f}")
     click.echo(f"Test ROC-AUC:     {results['test_metrics']['roc_auc']:.4f}")
     click.echo(f"Test Brier Score: {results['test_metrics']['brier_score']:.4f}")
+    if "calibration" in results:
+        c = results["calibration"]
+        click.echo("--- Learned Data-Driven Temporal Parameters ---")
+        click.echo(f"Learned Grace Period:   {c['learned_grace_period_days']:.1f} days")
+        click.echo(f"Factual Half-Life:      {c['factual_half_life_days']:.1f} days")
+        click.echo(f"Logical Half-Life:      {c['logical_half_life_days']:.1f} days")
+        click.echo(f"Synergy Half-Life:      {c['synergy_half_life_days']:.1f} days")
+        click.echo(f"Brownian Alpha Gap:     {c['alpha_gap']:.4f}")
 
 
 @cli.command("evaluate")

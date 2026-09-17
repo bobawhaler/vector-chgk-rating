@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -52,9 +53,6 @@ class TimeDecayModule(nn.Module):
         super().__init__()
         self.dim_k = dim_k
         self.config = config or TimeDecayConfig()
-        self.grace_period_days = self.config.grace_period_days
-        self.alpha_gap = self.config.alpha_gap
-
         # Compute initial lambda rates from half-lives: lambda = ln(2) / HalfLife
         # First dim_k // 2 dimensions: factual knowledge (fast decay)
         # Remaining dimensions: logical reasoning (slow decay)
@@ -81,6 +79,20 @@ class TimeDecayModule(nn.Module):
         else:
             self.register_buffer("raw_gamma_syn", torch.tensor(raw_gamma))
 
+        # Grace period parameter: G_grace (days)
+        raw_grace = _inverse_softplus(self.config.grace_period_days)
+        if trainable_rates:
+            self.raw_grace_period = nn.Parameter(torch.tensor(raw_grace))
+        else:
+            self.register_buffer("raw_grace_period", torch.tensor(raw_grace))
+
+        # Brownian variance expansion parameter: alpha_gap
+        raw_alpha = _inverse_softplus(self.config.alpha_gap)
+        if trainable_rates:
+            self.raw_alpha_gap = nn.Parameter(torch.tensor(raw_alpha))
+        else:
+            self.register_buffer("raw_alpha_gap", torch.tensor(raw_alpha))
+
     @property
     def lambda_decay(self) -> torch.Tensor:
         """Effective non-negative per-dimension knowledge decay rates."""
@@ -90,6 +102,40 @@ class TimeDecayModule(nn.Module):
     def gamma_syn(self) -> torch.Tensor:
         """Effective non-negative synergy decay rate."""
         return F.softplus(self.raw_gamma_syn)
+
+    @property
+    def grace_period_days(self) -> torch.Tensor:
+        """Effective learned grace period in days."""
+        return F.softplus(self.raw_grace_period)
+
+    @property
+    def alpha_gap(self) -> torch.Tensor:
+        """Effective learned Brownian variance factor."""
+        return F.softplus(self.raw_alpha_gap)
+
+    def get_calibration_summary(self) -> Dict[str, Any]:
+        """Compute human-interpretable calibration values (half-lives and grace period in days)."""
+        with torch.no_grad():
+            lambdas = self.lambda_decay.cpu().numpy()
+            gamma = float(self.gamma_syn.item())
+            grace = float(self.grace_period_days.item())
+            alpha = float(self.alpha_gap.item())
+
+            ln2 = math.log(2.0)
+            # Clip small lambdas to avoid division by zero
+            half_lives = [float(ln2 / max(lam, 1e-7)) for lam in lambdas]
+            half_dim = len(half_lives) // 2
+            avg_fact_hl = float(np.mean(half_lives[:half_dim]))
+            avg_logic_hl = float(np.mean(half_lives[half_dim:]))
+            syn_hl = float(ln2 / max(gamma, 1e-7))
+
+            return {
+                "learned_grace_period_days": round(grace, 1),
+                "factual_half_life_days": round(avg_fact_hl, 1),
+                "logical_half_life_days": round(avg_logic_hl, 1),
+                "synergy_half_life_days": round(syn_hl, 1),
+                "alpha_gap": round(alpha, 4),
+            }
 
     def apply_knowledge_decay(
         self,
