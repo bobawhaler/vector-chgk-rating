@@ -69,8 +69,20 @@ def evaluate_model(
             question_id = batch["question_id"].to(device)
             format_id = batch["format_id"].to(device)
             labels = batch["label"].to(device)
+            player_delta_t = batch.get("player_delta_t")
+            if player_delta_t is not None:
+                player_delta_t = player_delta_t.to(device)
+            pairwise_delta_t = batch.get("pairwise_delta_t")
+            if pairwise_delta_t is not None:
+                pairwise_delta_t = pairwise_delta_t.to(device)
 
-            out = model(player_ids, question_id, format_id)
+            out = model(
+                player_ids,
+                question_id,
+                format_id,
+                player_delta_t=player_delta_t,
+                pairwise_delta_t=pairwise_delta_t,
+            )
             probs = out["probs"].squeeze(-1).cpu().numpy().tolist()
             targets = labels.squeeze(-1).cpu().numpy().tolist()
 
@@ -174,9 +186,21 @@ def train_model(
             question_id = batch["question_id"].to(device)
             format_id = batch["format_id"].to(device)
             labels = batch["label"].to(device)
+            player_delta_t = batch.get("player_delta_t")
+            if player_delta_t is not None:
+                player_delta_t = player_delta_t.to(device)
+            pairwise_delta_t = batch.get("pairwise_delta_t")
+            if pairwise_delta_t is not None:
+                pairwise_delta_t = pairwise_delta_t.to(device)
 
             optimizer.zero_grad()
-            out = model(player_ids, question_id, format_id)
+            out = model(
+                player_ids,
+                question_id,
+                format_id,
+                player_delta_t=player_delta_t,
+                pairwise_delta_t=pairwise_delta_t,
+            )
             loss = criterion(out["logits"], labels)
 
             loss.backward()

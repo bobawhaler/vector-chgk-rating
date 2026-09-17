@@ -368,13 +368,14 @@ class ChGKDataIngester:
 
 def generate_synthetic_dataset(
     output_parquet_path: Path = DEFAULT_PARQUET_PATH,
-    num_tournaments: int = 25,
+    num_tournaments: int = 30,
     num_players: int = 300,
     num_teams: int = 50,
     questions_per_tournament: int = 36,
     seed: int = 42,
+    start_year: int = 2022,
 ) -> pd.DataFrame:
-    """Generate realistic synthetic ChGK dataset for offline testing and benchmarking."""
+    """Generate realistic synthetic ChGK dataset with temporal intervals and hiatuses for dynamic tracking."""
     random.seed(seed)
     formats = [FORMAT_OFFLINE, FORMAT_SYNC, FORMAT_ONLINE]
     format_weights = [0.4, 0.4, 0.2]
@@ -386,39 +387,59 @@ def generate_synthetic_dataset(
     teams: Dict[int, List[int]] = {}
     player_pool = list(range(1, num_players + 1))
     for t_id in range(1, num_teams + 1):
-        # Pick 6 players
         roster = random.sample(player_pool, 6)
         teams[t_id] = roster
 
+    # Dedicated hiatus players (e.g., players 1-10 play early, then experience a 2-3 year gap)
+    hiatus_players = set(range(1, 15))
+
     records: List[Dict[str, Any]] = []
-    base_date = datetime(2023, 1, 1)
+    base_date = datetime(start_year, 1, 1)
+    player_last_seen: Dict[int, datetime] = {}
 
     for t_idx in range(1, num_tournaments + 1):
         t_id = 1000 + t_idx
         t_fmt = random.choices(formats, weights=format_weights, k=1)[0]
-        t_date = (base_date + timedelta(days=t_idx * 14)).strftime("%Y-%m-%d")
+        # Spread tournaments every ~30 to 45 days across multiple years
+        curr_dt = base_date + timedelta(days=int(t_idx * 40))
+        t_date = curr_dt.strftime("%Y-%m-%d")
 
-        # Questions for this tournament
-        for q_num in range(1, questions_per_tournament + 1):
-            q_id = f"{t_id}_{q_num}"
-            q_difficulty = random.gauss(0.2, 1.2)  # Difficulty threshold
+        # Sample participating teams
+        participating_teams = random.sample(list(teams.keys()), min(25, num_teams))
 
-            # Sample participating teams (e.g. 20-30 teams per tournament)
-            participating_teams = random.sample(list(teams.keys()), min(25, num_teams))
+        for team_id in participating_teams:
+            roster = list(teams[team_id])
 
-            for team_id in participating_teams:
-                roster = list(teams[team_id])
-                # Occasional substitution
-                if random.random() < 0.15:
-                    sub_idx = random.randint(0, 5)
-                    roster[sub_idx] = random.choice(player_pool)
+            # In middle tournaments (e.g. t_idx between 10 and 24), hiatus players don't play
+            if 10 <= t_idx <= 24:
+                roster = [
+                    random.choice([p for p in player_pool if p not in hiatus_players])
+                    if p in hiatus_players else p
+                    for p in roster
+                ]
+            elif random.random() < 0.15:
+                # Occasional random substitution
+                sub_idx = random.randint(0, 5)
+                roster[sub_idx] = random.choice(player_pool)
 
-                # Team knowledge pooling: max skill
-                max_skill = max(player_true_skills[p] for p in roster)
-                # Team synergy bonus
-                synergy = random.gauss(0.1, 0.2)
-                # Online anomaly boost (for online factual questions)
-                anomaly = 0.4 if (t_fmt == FORMAT_ONLINE and random.random() < 0.3) else 0.0
+            # Compute days since last game for each player in roster
+            days_since_last: List[float] = []
+            for p in roster:
+                if p in player_last_seen:
+                    gap = (curr_dt - player_last_seen[p]).total_seconds() / 86400.0
+                else:
+                    gap = 0.0
+                days_since_last.append(round(gap, 1))
+                player_last_seen[p] = curr_dt
+
+            # Team knowledge pooling: max skill
+            max_skill = max(player_true_skills[p] for p in roster)
+            synergy = random.gauss(0.1, 0.2)
+            anomaly = 0.4 if (t_fmt == FORMAT_ONLINE and random.random() < 0.3) else 0.0
+
+            for q_num in range(1, questions_per_tournament + 1):
+                q_id = f"{t_id}_{q_num}"
+                q_difficulty = random.gauss(0.2, 1.2)
 
                 prob = 1.0 / (1.0 + pow(2.7182818, -(max_skill - q_difficulty + synergy + anomaly)))
                 solved = 1 if random.random() < prob else 0
@@ -431,6 +452,7 @@ def generate_synthetic_dataset(
                     "player_ids": roster,
                     "question_id": q_id,
                     "solved": solved,
+                    "days_since_last_game": days_since_last,
                 })
 
     df = pd.DataFrame(records)
@@ -438,3 +460,4 @@ def generate_synthetic_dataset(
     df.to_parquet(output_parquet_path, index=False)
     logger.info("Saved %d synthetic observations to %s", len(df), output_parquet_path)
     return df
+

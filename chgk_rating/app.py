@@ -1,18 +1,23 @@
-"""FastAPI application for ChGK Dual Latent Embedding Rating System."""
+"""FastAPI application for ChGK Dual Latent Embedding Rating System with Dynamic Time Tracking."""
 
 from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from chgk_rating.analytics import compute_team_synergy_details, load_model_and_metadata
+from chgk_rating.analytics import (
+    compute_team_synergy_details,
+    get_player_historical_timeline,
+    load_model_and_metadata,
+)
 from chgk_rating.config import DEFAULT_META_PATH, DEFAULT_MODEL_PATH, FORMAT_OFFLINE
 from chgk_rating.dataset import DatasetMetadata
 from chgk_rating.model import DualEmbeddingChGKModel
@@ -51,6 +56,9 @@ class PredictMatchRequest(BaseModel):
     format: str = Field(
         default=FORMAT_OFFLINE, description="Tournament format: offline, sync, or online"
     )
+    match_date: Optional[str] = Field(
+        default=None, description="Match date in ISO format YYYY-MM-DD for dynamic inactivity decay"
+    )
 
 
 class QuestionPrediction(BaseModel):
@@ -64,6 +72,7 @@ class QuestionPrediction(BaseModel):
 class PredictMatchResponse(BaseModel):
     players: List[str]
     format: str
+    match_date: Optional[str]
     total_synergy: float
     predictions: List[QuestionPrediction]
 
@@ -75,6 +84,9 @@ class TeamSynergyRequest(BaseModel):
     format: str = Field(
         default=FORMAT_OFFLINE, description="Tournament format: offline, sync, or online"
     )
+    match_date: Optional[str] = Field(
+        default=None, description="Match date for joint inactivity synergy decay"
+    )
 
 
 class PairwiseSynergy(BaseModel):
@@ -85,6 +97,7 @@ class PairwiseSynergy(BaseModel):
 
 class TeamSynergyResponse(BaseModel):
     format: str
+    target_date: Optional[str]
     total_synergy: float
     players: List[str]
     synergy_matrix: List[List[float]]
@@ -105,6 +118,21 @@ class PlayerProfileResponse(BaseModel):
     top_synergistic_teammates: List[SynergisticTeammate]
 
 
+class TimelinePoint(BaseModel):
+    date: str
+    days_inactive: float
+    is_active: bool
+    effective_knowledge_norm: float
+    factual_norm: float
+    logical_norm: float
+    retention_ratio: float
+
+
+class PlayerTimelineResponse(BaseModel):
+    player_id: str
+    timeline: List[TimelinePoint]
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Attempt to pre-load model if available
@@ -121,15 +149,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="ChGK Dual Latent Embedding Rating System",
-    description="Neural rating model for player skill, team synergy, and question difficulty in ChGK.",
-    version="0.1.0",
+    description="Neural rating model with dynamic time decay for player skill, team synergy, and question difficulty in ChGK.",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
 
 @app.get("/")
 def root() -> Dict[str, str]:
-    return {"message": "ChGK Dual Latent Embedding Rating API is running."}
+    return {"message": "ChGK Dual Latent Embedding Rating API is running with Dynamic Time Tracking."}
 
 
 @app.get("/health")
@@ -161,6 +189,38 @@ def predict_match(req: PredictMatchRequest) -> PredictMatchResponse:
 
     fmt_id = metadata.format_map.get(req.format.lower(), 0)
 
+    # Compute time gaps if match_date provided
+    player_delta_t: Optional[torch.Tensor] = None
+    pairwise_delta_t: Optional[torch.Tensor] = None
+
+    if req.match_date:
+        try:
+            match_dt = datetime.strptime(str(req.match_date)[:10], "%Y-%m-%d")
+        except ValueError:
+            match_dt = datetime(2026, 9, 1)
+
+        p_deltas = [0.0] * 6
+        for i, p_str in enumerate(valid_p_ids[:6]):
+            if p_str in metadata.player_last_date:
+                last_dt = datetime.strptime(metadata.player_last_date[p_str][:10], "%Y-%m-%d")
+                p_deltas[i] = max(0.0, (match_dt - last_dt).total_seconds() / 86400.0)
+        player_delta_t = torch.tensor([p_deltas], dtype=torch.float32)
+
+        # Pairwise gaps
+        pair_mat = np.zeros((1, 6, 6), dtype=np.float32)
+        n_p = len(valid_p_ids[:6])
+        for i in range(n_p):
+            for m in range(n_p):
+                if i != m:
+                    p1, p2 = sorted([valid_p_ids[i], valid_p_ids[m]])
+                    key = f"{p1}_{p2}"
+                    if key in metadata.pair_last_date:
+                        last_p_dt = datetime.strptime(metadata.pair_last_date[key][:10], "%Y-%m-%d")
+                        pair_mat[0, i, m] = max(0.0, (match_dt - last_p_dt).total_seconds() / 86400.0)
+                    else:
+                        pair_mat[0, i, m] = max(p_deltas[i], p_deltas[m])
+        pairwise_delta_t = torch.tensor(pair_mat, dtype=torch.float32)
+
     # Tensor representations
     p_tensor = torch.tensor([mapped_players], dtype=torch.long)  # (1, 6)
     f_tensor = torch.tensor([fmt_id], dtype=torch.long)          # (1,)
@@ -177,7 +237,13 @@ def predict_match(req: PredictMatchRequest) -> PredictMatchResponse:
                 q_idx = 0
 
             q_tensor = torch.tensor([q_idx], dtype=torch.long)
-            out = model(p_tensor, q_tensor, f_tensor)
+            out = model(
+                p_tensor,
+                q_tensor,
+                f_tensor,
+                player_delta_t=player_delta_t,
+                pairwise_delta_t=pairwise_delta_t,
+            )
 
             p_final = float(out["probs"][0, 0].item())
             p_gen = float(out["p_gen"][0, 0].item())
@@ -198,6 +264,7 @@ def predict_match(req: PredictMatchRequest) -> PredictMatchResponse:
     return PredictMatchResponse(
         players=valid_p_ids,
         format=req.format,
+        match_date=req.match_date,
         total_synergy=total_synergy_val,
         predictions=predictions,
     )
@@ -207,10 +274,13 @@ def predict_match(req: PredictMatchRequest) -> PredictMatchResponse:
 def get_team_synergy(req: TeamSynergyRequest) -> TeamSynergyResponse:
     model, metadata = get_model_and_meta()
     details = compute_team_synergy_details(
-        model, metadata, req.player_ids, format_name=req.format
+        model,
+        metadata,
+        req.player_ids,
+        format_name=req.format,
+        target_date=req.match_date,
     )
 
-    # Greedy optimal circular seating order heuristic to maximize adjacent synergy
     players = details["players"]
     matrix = details["synergy_matrix"]
     n = len(players)
@@ -223,7 +293,6 @@ def get_team_synergy(req: TeamSynergyRequest) -> TeamSynergyResponse:
         remaining.remove(current)
 
         while remaining:
-            # Find closest synergistic teammate among remaining
             best_next = max(remaining, key=lambda idx: matrix[current][idx])
             seating_order.append(players[best_next])
             remaining.remove(best_next)
@@ -231,6 +300,7 @@ def get_team_synergy(req: TeamSynergyRequest) -> TeamSynergyResponse:
 
     return TeamSynergyResponse(
         format=details["format"],
+        target_date=details.get("target_date"),
         total_synergy=details["total_synergy"],
         players=players,
         synergy_matrix=matrix,
@@ -258,15 +328,11 @@ def get_player_profile(player_id: str) -> PlayerProfileResponse:
         c_base_norm = float(np.linalg.norm(c_base))
         c_delta_norm = float(np.linalg.norm(c_delta))
 
-        # Find top 5 synergistic partners across all players (offline format)
         all_c_base = model.player_c_base.weight.cpu().numpy()  # (N, M)
         w_syn = model.W_synergy.cpu().numpy()                  # (M, M)
-
-        # synergy score: c_i * W * c_m^T
         target_cw = np.dot(c_base, w_syn)                     # (M,)
         scores = np.dot(all_c_base, target_cw)                 # (N,)
 
-    # Rank partners excluding self and padding (idx 0)
     top_partner_indices = np.argsort(-scores)
     top_teammates: List[SynergisticTeammate] = []
 
@@ -290,4 +356,25 @@ def get_player_profile(player_id: str) -> PlayerProfileResponse:
         communication_base_norm=c_base_norm,
         format_sensitivity_norm=c_delta_norm,
         top_synergistic_teammates=top_teammates,
+    )
+
+
+@app.get("/player/{player_id}/historical_timeline", response_model=PlayerTimelineResponse)
+def get_player_timeline(
+    player_id: str,
+    start_date: str = Query("2022-01-01", description="Timeline start date (YYYY-MM-DD)"),
+    end_date: str = Query("2026-09-01", description="Timeline end date (YYYY-MM-DD)"),
+    step_days: int = Query(30, ge=1, le=365, description="Step in days between timeline evaluations"),
+) -> PlayerTimelineResponse:
+    """Return historical skill trajectory showing growth vs inactivity decay curves."""
+    model, metadata = get_model_and_meta()
+    if str(player_id) not in metadata.player_indexer.item_to_idx:
+        raise HTTPException(status_code=404, detail=f"Player {player_id} not found.")
+
+    raw_timeline = get_player_historical_timeline(
+        model, metadata, player_id, start_date=start_date, end_date=end_date, step_days=step_days
+    )
+    return PlayerTimelineResponse(
+        player_id=str(player_id),
+        timeline=[TimelinePoint(**pt) for pt in raw_timeline],
     )

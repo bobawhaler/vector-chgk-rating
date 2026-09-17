@@ -81,8 +81,11 @@ def compute_team_synergy_details(
     metadata: DatasetMetadata,
     player_ids: List[Union[int, str]],
     format_name: str = FORMAT_OFFLINE,
+    target_date: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Compute pairwise synergy matrix and total synergy for custom roster across formats."""
+    """Compute pairwise synergy matrix and total synergy for custom roster across formats, with time decay."""
+    from datetime import datetime
+
     fmt_id = metadata.format_map.get(format_name.lower(), 0)
     p_indexer = metadata.player_indexer
 
@@ -103,11 +106,45 @@ def compute_team_synergy_details(
     p_tensor = torch.tensor([padded_indices], dtype=torch.long)
     fmt_tensor = torch.tensor([fmt_id], dtype=torch.long)
 
+    # Compute pairwise delta_t if target_date provided
+    pairwise_delta_t: Optional[torch.Tensor] = None
+    if target_date is not None and metadata.pair_last_date:
+        try:
+            t_dt = datetime.strptime(str(target_date)[:10], "%Y-%m-%d")
+        except ValueError:
+            t_dt = datetime(2026, 9, 1)
+
+        pair_mat = np.zeros((1, 6, 6), dtype=np.float32)
+        n_p = len(valid_player_ids[:6])
+        for i in range(n_p):
+            for m in range(n_p):
+                if i != m:
+                    p1, p2 = sorted([valid_player_ids[i], valid_player_ids[m]])
+                    key = f"{p1}_{p2}"
+                    if key in metadata.pair_last_date:
+                        last_dt = datetime.strptime(metadata.pair_last_date[key][:10], "%Y-%m-%d")
+                        pair_mat[0, i, m] = max(0.0, (t_dt - last_dt).total_seconds() / 86400.0)
+                    elif p1 in metadata.player_last_date and p2 in metadata.player_last_date:
+                        # Fallback to older of their individual games
+                        dt1 = datetime.strptime(metadata.player_last_date[p1][:10], "%Y-%m-%d")
+                        dt2 = datetime.strptime(metadata.player_last_date[p2][:10], "%Y-%m-%d")
+                        older_dt = min(dt1, dt2)
+                        pair_mat[0, i, m] = max(0.0, (t_dt - older_dt).total_seconds() / 86400.0)
+                    else:
+                        pair_mat[0, i, m] = 0.0
+        pairwise_delta_t = torch.tensor(pair_mat, dtype=torch.float32)
+
     with torch.no_grad():
         c_eff = model.get_effective_communication(p_tensor, fmt_tensor)  # (1, 6, M)
         mask = p_tensor != 0
-        s_mat = model.compute_team_synergy_matrix(c_eff, mask)[0].cpu().numpy()  # (6, 6)
-        total_s = float(model.compute_team_synergy(c_eff, mask)[0, 0].item())
+        s_mat = model.compute_team_synergy_matrix(
+            c_eff, mask, pairwise_delta_t=pairwise_delta_t
+        )[0].cpu().numpy()  # (6, 6)
+        total_s = float(
+            model.compute_team_synergy(
+                c_eff, mask, pairwise_delta_t=pairwise_delta_t
+            )[0, 0].item()
+        )
 
     # Build structured pairwise response for actual players provided
     n_players = len(mapped_indices[:6])
@@ -124,7 +161,6 @@ def compute_team_synergy_details(
 
     pairwise_list.sort(key=lambda x: x["synergy_score"], reverse=True)
 
-    # Optimal seating arrangement heuristic: arrange top synergistic pairs adjacent
     return {
         "format": format_name,
         "format_id": fmt_id,
@@ -133,7 +169,74 @@ def compute_team_synergy_details(
         "synergy_matrix": matrix_subset,
         "pairwise_rankings": pairwise_list,
         "best_pair": pairwise_list[0] if pairwise_list else None,
+        "target_date": target_date,
     }
+
+
+def get_player_historical_timeline(
+    model: DualEmbeddingChGKModel,
+    metadata: DatasetMetadata,
+    player_id: Union[int, str],
+    start_date: str = "2022-01-01",
+    end_date: str = "2026-09-01",
+    step_days: int = 30,
+) -> List[Dict[str, Any]]:
+    """Generate chronological skill trajectory and inactivity decay curve for a player."""
+    from datetime import datetime, timedelta
+
+    p_str = str(player_id)
+    if p_str not in metadata.player_indexer.item_to_idx:
+        return []
+
+    p_idx = metadata.player_indexer.get_idx(p_str)
+    raw_k = model.player_k_emb.weight[p_idx].unsqueeze(0)  # (1, D)
+    raw_norm = float(torch.norm(raw_k).item())
+    half_dim = raw_k.size(-1) // 2
+
+    start_dt = datetime.strptime(start_date[:10], "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date[:10], "%Y-%m-%d")
+
+    # Get last known tournament date before target
+    player_last_str = metadata.player_last_date.get(p_str, start_date)
+    last_game_dt = datetime.strptime(player_last_str[:10], "%Y-%m-%d")
+
+    timeline: List[Dict[str, Any]] = []
+    curr = start_dt
+
+    while curr <= end_dt:
+        curr_str = curr.strftime("%Y-%m-%d")
+
+        # Inactive days relative to last game
+        if curr < last_game_dt:
+            # During career up to last game, assume player is actively competing
+            days_inactive = 0.0
+            is_active = True
+        else:
+            days_inactive = (curr - last_game_dt).total_seconds() / 86400.0
+            is_active = days_inactive <= 30.0
+
+        d_ten = torch.tensor([[days_inactive]], dtype=torch.float32)
+        with torch.no_grad():
+            decayed_k = model.time_decay.apply_knowledge_decay(raw_k, d_ten)[0]
+            total_norm = float(torch.norm(decayed_k).item())
+            fact_norm = float(torch.norm(decayed_k[:half_dim]).item())
+            logic_norm = float(torch.norm(decayed_k[half_dim:]).item())
+
+        retention = total_norm / max(raw_norm, 1e-6)
+
+        timeline.append({
+            "date": curr_str,
+            "days_inactive": round(days_inactive, 1),
+            "is_active": is_active,
+            "effective_knowledge_norm": round(total_norm, 4),
+            "factual_norm": round(fact_norm, 4),
+            "logical_norm": round(logic_norm, 4),
+            "retention_ratio": round(retention, 4),
+        })
+
+        curr += timedelta(days=step_days)
+
+    return timeline
 
 
 def detect_online_anomalies(

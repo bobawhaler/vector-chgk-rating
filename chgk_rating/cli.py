@@ -193,8 +193,9 @@ def evaluate(data_path: str, model_path: str, meta_path: str) -> None:
     help="Tournament format",
 )
 @click.option("--question-id", default=None, help="Optional question ID to predict")
-def predict_team(players: str, fmt: str, question_id: Optional[str]) -> None:
-    """Compute team synergy and predict question outcome for custom roster."""
+@click.option("--match-date", default=None, help="Optional match date (YYYY-MM-DD) for time decay")
+def predict_team(players: str, fmt: str, question_id: Optional[str], match_date: Optional[str]) -> None:
+    """Compute team synergy and predict question outcome for custom roster, with optional time decay."""
     m_path = DEFAULT_MODEL_PATH
     meta_p = DEFAULT_META_PATH
     if not m_path.exists() or not meta_p.exists():
@@ -204,9 +205,13 @@ def predict_team(players: str, fmt: str, question_id: Optional[str]) -> None:
     player_list = [p.strip() for p in players.split(",") if p.strip()]
     model, metadata = load_model_and_metadata(m_path, meta_p)
 
-    details = compute_team_synergy_details(model, metadata, player_list, format_name=fmt)
+    details = compute_team_synergy_details(
+        model, metadata, player_list, format_name=fmt, target_date=match_date
+    )
     click.echo("================ Team Synergy Analysis ================")
     click.echo(f"Format:        {details['format']}")
+    if match_date:
+        click.echo(f"Match Date:    {match_date} (Inactivity Decay Active)")
     click.echo(f"Total Synergy: {details['total_synergy']:.4f}")
     click.echo(f"Players:       {', '.join(details['players'])}")
     if details["best_pair"]:
@@ -217,24 +222,93 @@ def predict_team(players: str, fmt: str, question_id: Optional[str]) -> None:
         )
 
     if question_id:
+        import numpy as np
         import torch
+        from datetime import datetime
+
         q_idx = metadata.question_indexer.get_idx(question_id, default=0)
         p_indices = [metadata.player_indexer.get_idx(p, default=0) for p in player_list[:6]]
         while len(p_indices) < 6:
             p_indices.append(0)
+
+        # Compute delta_t if match_date provided
+        player_delta_t: Optional[torch.Tensor] = None
+        pairwise_delta_t: Optional[torch.Tensor] = None
+        if match_date:
+            try:
+                m_dt = datetime.strptime(str(match_date)[:10], "%Y-%m-%d")
+            except ValueError:
+                m_dt = datetime(2026, 9, 1)
+
+            p_deltas = [0.0] * 6
+            for i, p_str in enumerate(player_list[:6]):
+                if p_str in metadata.player_last_date:
+                    last_dt = datetime.strptime(metadata.player_last_date[p_str][:10], "%Y-%m-%d")
+                    p_deltas[i] = max(0.0, (m_dt - last_dt).total_seconds() / 86400.0)
+            player_delta_t = torch.tensor([p_deltas], dtype=torch.float32)
+
+            pair_mat = np.zeros((1, 6, 6), dtype=np.float32)
+            n_p = len(player_list[:6])
+            for i in range(n_p):
+                for m in range(n_p):
+                    if i != m:
+                        p1, p2 = sorted([player_list[i], player_list[m]])
+                        key = f"{p1}_{p2}"
+                        if key in metadata.pair_last_date:
+                            l_dt = datetime.strptime(metadata.pair_last_date[key][:10], "%Y-%m-%d")
+                            pair_mat[0, i, m] = max(0.0, (m_dt - l_dt).total_seconds() / 86400.0)
+                        else:
+                            pair_mat[0, i, m] = max(p_deltas[i], p_deltas[m])
+            pairwise_delta_t = torch.tensor(pair_mat, dtype=torch.float32)
 
         p_ten = torch.tensor([p_indices], dtype=torch.long)
         q_ten = torch.tensor([q_idx], dtype=torch.long)
         f_ten = torch.tensor([details["format_id"]], dtype=torch.long)
 
         with torch.no_grad():
-            out = model(p_ten, q_ten, f_ten)
+            out = model(
+                p_ten,
+                q_ten,
+                f_ten,
+                player_delta_t=player_delta_t,
+                pairwise_delta_t=pairwise_delta_t,
+            )
             click.echo("---------------- Outcome Prediction ----------------")
             click.echo(f"Question:            {question_id}")
             click.echo(f"Solved Probability:  {out['probs'][0, 0].item():.4f}")
             click.echo(f"Raw Knowledge Prob:  {out['p_gen'][0, 0].item():.4f}")
             click.echo(f"Knowledge Logit:     {out['z_know'][0, 0].item():.4f}")
     click.echo("=======================================================")
+
+
+@cli.command("player-timeline")
+@click.option("--player-id", required=True, help="Player ID to inspect")
+@click.option("--start-date", default="2022-01-01", help="Timeline start date (YYYY-MM-DD)")
+@click.option("--end-date", default="2026-09-01", help="Timeline end date (YYYY-MM-DD)")
+@click.option("--step-days", default=90, type=int, help="Sampling interval in days")
+def player_timeline_cmd(player_id: str, start_date: str, end_date: str, step_days: int) -> None:
+    """Inspect a player's historical skill trajectory and inactivity decay curve."""
+    if not DEFAULT_MODEL_PATH.exists() or not DEFAULT_META_PATH.exists():
+        click.echo("Trained model not found. Run train first.", err=True)
+        sys.exit(1)
+
+    from chgk_rating.analytics import get_player_historical_timeline
+    model, metadata = load_model_and_metadata(DEFAULT_MODEL_PATH, DEFAULT_META_PATH)
+    timeline = get_player_historical_timeline(
+        model, metadata, player_id, start_date=start_date, end_date=end_date, step_days=step_days
+    )
+    if not timeline:
+        click.echo(f"Player {player_id} not found in model.")
+        return
+
+    click.echo(f"Historical Skill Timeline for Player {player_id}:")
+    click.echo(f"{'Date':<12} {'Inactive':<10} {'Eff. ||k||':<12} {'Factual':<10} {'Logical':<10} {'Retention'}")
+    click.echo("-" * 65)
+    for pt in timeline:
+        click.echo(
+            f"{pt['date']:<12} {pt['days_inactive']:<10.0f} {pt['effective_knowledge_norm']:<12.4f} "
+            f"{pt['factual_norm']:<10.4f} {pt['logical_norm']:<10.4f} {pt['retention_ratio']:<10.1%}"
+        )
 
 
 @cli.command("top-players")

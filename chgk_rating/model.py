@@ -9,13 +9,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from chgk_rating.time_decay import TimeDecayConfig, TimeDecayModule
+
 
 class DualEmbeddingChGKModel(nn.Module):
     """Dual Latent Embedding Neural Rating Model for ChGK.
 
     Represents players with knowledge (D) and communication/format (M) embeddings,
     questions with requirements (D), bias, and discrimination,
-    and teams through max-pooled knowledge and pairwise communication synergy.
+    and teams through max-pooled knowledge and pairwise communication synergy,
+    with dynamic time-decay tracking for inactivity and synergy erosion.
     """
 
     def __init__(
@@ -26,6 +29,7 @@ class DualEmbeddingChGKModel(nn.Module):
         dim_c: int = 8,
         num_formats: int = 3,
         padding_player_idx: int = 0,
+        time_decay_config: Optional[TimeDecayConfig] = None,
     ) -> None:
         super().__init__()
         self.num_players = num_players
@@ -82,6 +86,9 @@ class DualEmbeddingChGKModel(nn.Module):
         self.W_synergy = nn.Parameter(torch.empty(dim_c, dim_c))
         nn.init.xavier_normal_(self.W_synergy, gain=0.1)
 
+        # Dynamic Time Decay & Skill Tracking Module
+        self.time_decay = TimeDecayModule(dim_k=dim_k, config=time_decay_config)
+
         # Online Anomaly Adjustment parameter/bias
         self.online_anomaly_weight = nn.Parameter(torch.zeros(1))
 
@@ -119,13 +126,17 @@ class DualEmbeddingChGKModel(nn.Module):
         return c_eff * mask
 
     def compute_team_synergy_matrix(
-        self, c_eff: torch.Tensor, player_mask: Optional[torch.Tensor] = None
+        self,
+        c_eff: torch.Tensor,
+        player_mask: Optional[torch.Tensor] = None,
+        pairwise_delta_t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute pairwise synergy matrix for team players: S_im = c_i^T * W * c_m.
 
         Args:
             c_eff: Tensor of shape (B, K, M)
             player_mask: Optional boolean Tensor of shape (B, K) where True = valid player
+            pairwise_delta_t: Optional Tensor of shape (B, K, K) containing days since joint game
 
         Returns:
             Tensor of shape (B, K, K) containing pairwise synergy scores.
@@ -135,6 +146,10 @@ class DualEmbeddingChGKModel(nn.Module):
         # S_mat: (B, K, K) = C_W * C^T
         s_mat = torch.matmul(c_w, c_eff.transpose(-1, -2))  # (B, K, K)
 
+        # Apply pairwise time decay if elapsed time provided
+        if pairwise_delta_t is not None:
+            s_mat = self.time_decay.apply_synergy_decay(s_mat, pairwise_delta_t)
+
         if player_mask is not None:
             # Mask out invalid pairs
             valid_2d = player_mask.unsqueeze(1) & player_mask.unsqueeze(2)  # (B, K, K)
@@ -143,18 +158,22 @@ class DualEmbeddingChGKModel(nn.Module):
         return s_mat
 
     def compute_team_synergy(
-        self, c_eff: torch.Tensor, player_mask: Optional[torch.Tensor] = None
+        self,
+        c_eff: torch.Tensor,
+        player_mask: Optional[torch.Tensor] = None,
+        pairwise_delta_t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute total team synergy: S_team = sum_{i < m} S_im.
 
         Args:
             c_eff: Tensor of shape (B, K, M)
             player_mask: Optional boolean Tensor of shape (B, K)
+            pairwise_delta_t: Optional Tensor of shape (B, K, K)
 
         Returns:
             Tensor of shape (B, 1)
         """
-        s_mat = self.compute_team_synergy_matrix(c_eff, player_mask)  # (B, K, K)
+        s_mat = self.compute_team_synergy_matrix(c_eff, player_mask, pairwise_delta_t)  # (B, K, K)
         # Extract upper triangle strictly above diagonal (i < m)
         k = s_mat.size(-1)
         triu_indices = torch.triu_indices(k, k, offset=1, device=s_mat.device)
@@ -168,8 +187,10 @@ class DualEmbeddingChGKModel(nn.Module):
         format_ids: torch.Tensor,
         is_factual: Optional[torch.Tensor] = None,
         anomaly_delta: Optional[torch.Tensor] = None,
+        player_delta_t: Optional[torch.Tensor] = None,
+        pairwise_delta_t: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Forward pass for a batch of team-question observations.
+        """Forward pass for a batch of team-question observations with time decay.
 
         Args:
             player_ids: LongTensor of shape (B, K) - roster player indices
@@ -177,6 +198,8 @@ class DualEmbeddingChGKModel(nn.Module):
             format_ids: LongTensor of shape (B,) - format indices (0=offline, 1=sync, 2=online)
             is_factual: Optional LongTensor/FloatTensor of shape (B, 1) - 1 if factual question
             anomaly_delta: Optional FloatTensor of shape (B, 1) - explicit cheat adjustment
+            player_delta_t: Optional FloatTensor of shape (B, K) - elapsed days since last game per player
+            pairwise_delta_t: Optional FloatTensor of shape (B, K, K) - elapsed days since last joint game per pair
 
         Returns:
             Dict containing:
@@ -186,12 +209,26 @@ class DualEmbeddingChGKModel(nn.Module):
                 - 'z_know': z_know (B, 1)
                 - 's_team': S_team (B, 1)
                 - 'z_anomaly': z_anomaly (B, 1)
+                - 'k_team': K_team (B, D)
         """
         batch_size, k_players = player_ids.shape
         player_mask = player_ids != self.padding_player_idx  # (B, K)
 
-        # 1. Team Knowledge Pooling: K_team = max_pooling({k_i for i in T})
+        # 1. Player Knowledge Embeddings & Temporal Decay
         k_player_embs = self.player_k_emb(player_ids)  # (B, K, D)
+
+        if player_delta_t is not None:
+            # Apply asymmetric inactivity decay:
+            # k_i(t) = k_i * exp(-lambda_decay * max(0, Delta_t - G_grace))
+            k_player_embs = self.time_decay.apply_knowledge_decay(k_player_embs, player_delta_t)
+
+            # In training mode, apply Brownian variance scaling:
+            # eta_i(t) = sqrt(1.0 + alpha_gap * (Delta_t / 365.0))
+            if self.training:
+                gap_scale = self.time_decay.compute_training_gap_scale(player_delta_t).unsqueeze(-1)
+                k_player_embs = k_player_embs * gap_scale
+
+        # Team Knowledge Pooling: K_team(t) = max_pooling({k_i(t) for i in T})
         # For masked players, replace with large negative number before max pooling
         masked_k = k_player_embs.masked_fill(~player_mask.unsqueeze(-1), -1e9)
         # Handle edge case where entire team is padding
@@ -209,9 +246,9 @@ class DualEmbeddingChGKModel(nn.Module):
         z_know = a_j * (dot_kq - b_j)                      # (B, 1)
         p_gen = torch.sigmoid(z_know)
 
-        # 3. Team Synergy Matrix & S_team
+        # 3. Team Synergy Matrix & S_team with Pairwise Joint Decay
         c_eff = self.get_effective_communication(player_ids, format_ids)  # (B, K, M)
-        s_team = self.compute_team_synergy(c_eff, player_mask)            # (B, 1)
+        s_team = self.compute_team_synergy(c_eff, player_mask, pairwise_delta_t)  # (B, 1)
 
         # 4. Online Anomaly Adjustment:
         # If F == online and question is factual: z_anomaly = delta_cheat
@@ -236,6 +273,7 @@ class DualEmbeddingChGKModel(nn.Module):
             "z_know": z_know,
             "s_team": s_team,
             "z_anomaly": z_anomaly,
+            "k_team": k_team,
         }
 
     def compute_l2_regularization(self) -> torch.Tensor:
