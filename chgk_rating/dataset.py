@@ -164,7 +164,21 @@ class ChGKDataset(Dataset):
             if "date" in sorted_df.columns
             else ["2023-01-01"] * len(sorted_df)
         )
-        player_id_lists = sorted_df["player_ids"].tolist()
+        total_rows = len(sorted_df)
+        rosters_arr = np.zeros((total_rows, max_players_per_team), dtype=np.int64)
+        question_ids_arr = np.zeros(total_rows, dtype=np.int64)
+        format_ids_arr = np.zeros(total_rows, dtype=np.int64)
+        labels_arr = np.zeros((total_rows, 1), dtype=np.float32)
+        player_deltas_arr = np.zeros((total_rows, max_players_per_team), dtype=np.float32)
+        pairwise_deltas_arr = np.zeros(
+            (total_rows, max_players_per_team, max_players_per_team), dtype=np.float32
+        )
+
+        count = 0
+        last_team_key = None
+        cached_mapped_p: Optional[List[int]] = None
+        cached_p_deltas: Optional[List[float]] = None
+        cached_pair_mat: Optional[List[List[float]]] = None
 
         for q_id_raw, fmt_str, solved_val, curr_date_str, raw_players in zip(
             q_ids, fmt_strs, solved_vals, date_strs, player_id_lists
@@ -174,67 +188,78 @@ class ChGKDataset(Dataset):
 
             q_idx = q_idxer.get_idx(q_id_raw)
             fmt_id = fmt_map.get(fmt_str, 0)
-            curr_date = parse_date(curr_date_str)
 
-            # Extract raw players
-            if isinstance(raw_players, np.ndarray):
-                raw_players = raw_players.tolist()
-            elif not isinstance(raw_players, list):
-                raw_players = [raw_players]
+            # Check if team roster and date are identical to previous question
+            raw_tuple = tuple(raw_players) if isinstance(raw_players, (list, np.ndarray)) else (raw_players,)
+            team_key = (raw_tuple, curr_date_str)
 
-            mapped_p: List[int] = []
-            valid_raw_p: List[str] = []
-            p_deltas: List[float] = []
+            if team_key == last_team_key and cached_mapped_p is not None:
+                mapped_p = cached_mapped_p
+                p_deltas = cached_p_deltas
+                pair_mat = cached_pair_mat
+            else:
+                curr_date = parse_date(curr_date_str)
+                raw_p_list = list(raw_tuple)
+                mapped_p = []
+                valid_raw_p: List[str] = []
+                p_deltas = []
 
-            for p in raw_players[:max_players_per_team]:
-                p_str = str(p)
-                p_mapped = p_idxer.get_idx(p_str, default=0)
-                if p_mapped > 0:
-                    mapped_p.append(p_mapped)
-                    valid_raw_p.append(p_str)
+                for p in raw_p_list[:max_players_per_team]:
+                    p_str = str(p)
+                    p_mapped = p_idxer.get_idx(p_str, default=0)
+                    if p_mapped > 0:
+                        mapped_p.append(p_mapped)
+                        valid_raw_p.append(p_str)
 
-                    # Compute Delta t_i = curr_date - T_last_i
-                    if p_str in running_player_last:
-                        delta_days = max(
-                            0.0, (curr_date - running_player_last[p_str]).total_seconds() / 86400.0
-                        )
-                    else:
-                        delta_days = 0.0
-                    p_deltas.append(delta_days)
-
-                    if track_running_state:
-                        running_player_last[p_str] = curr_date
-
-            # Compute pairwise joint gaps
-            pair_mat = [[0.0] * max_players_per_team for _ in range(max_players_per_team)]
-            n_val = len(valid_raw_p)
-            for i in range(n_val):
-                for m in range(n_val):
-                    if i != m:
-                        p1, p2 = sorted([valid_raw_p[i], valid_raw_p[m]])
-                        pair_key = f"{p1}_{p2}"
-                        if pair_key in running_pair_last:
-                            p_days = max(
+                        if p_str in running_player_last:
+                            delta_days = max(
                                 0.0,
-                                (curr_date - running_pair_last[pair_key]).total_seconds() / 86400.0,
+                                (curr_date - running_player_last[p_str]).total_seconds() / 86400.0,
                             )
                         else:
-                            p_days = 0.0
-                        pair_mat[i][m] = p_days
-                        if track_running_state and i < m:
-                            running_pair_last[pair_key] = curr_date
+                            delta_days = 0.0
+                        p_deltas.append(delta_days)
 
-            # Pad to max_players
-            while len(mapped_p) < max_players_per_team:
-                mapped_p.append(0)
-                p_deltas.append(0.0)
+                        if track_running_state:
+                            running_player_last[p_str] = curr_date
 
-            rosters.append(mapped_p)
-            question_ids.append(q_idx)
-            format_ids.append(fmt_id)
-            labels.append(solved_val)
-            player_delta_ts.append(p_deltas)
-            pairwise_delta_ts.append(pair_mat)
+                # Compute pairwise joint gaps
+                pair_mat = [[0.0] * max_players_per_team for _ in range(max_players_per_team)]
+                n_val = len(valid_raw_p)
+                for i in range(n_val):
+                    for m in range(n_val):
+                        if i != m:
+                            p1, p2 = sorted([valid_raw_p[i], valid_raw_p[m]])
+                            pair_key = f"{p1}_{p2}"
+                            if pair_key in running_pair_last:
+                                p_days = max(
+                                    0.0,
+                                    (curr_date - running_pair_last[pair_key]).total_seconds()
+                                    / 86400.0,
+                                )
+                            else:
+                                p_days = 0.0
+                            pair_mat[i][m] = p_days
+                            if track_running_state and i < m:
+                                running_pair_last[pair_key] = curr_date
+
+                # Pad to max_players
+                while len(mapped_p) < max_players_per_team:
+                    mapped_p.append(0)
+                    p_deltas.append(0.0)
+
+                last_team_key = team_key
+                cached_mapped_p = mapped_p
+                cached_p_deltas = p_deltas
+                cached_pair_mat = pair_mat
+
+            rosters_arr[count] = mapped_p
+            question_ids_arr[count] = q_idx
+            format_ids_arr[count] = fmt_id
+            labels_arr[count, 0] = solved_val
+            player_deltas_arr[count] = p_deltas
+            pairwise_deltas_arr[count] = pair_mat
+            count += 1
 
         # Update metadata's global last seen timestamps if tracking
         if track_running_state:
@@ -243,12 +268,12 @@ class ChGKDataset(Dataset):
             for pair_key, dt_val in running_pair_last.items():
                 metadata.pair_last_date[pair_key] = dt_val.strftime("%Y-%m-%d")
 
-        self.rosters = torch.tensor(rosters, dtype=torch.long)
-        self.question_ids = torch.tensor(question_ids, dtype=torch.long)
-        self.format_ids = torch.tensor(format_ids, dtype=torch.long)
-        self.labels = torch.tensor(labels, dtype=torch.float32).unsqueeze(-1)
-        self.player_delta_ts = torch.tensor(player_delta_ts, dtype=torch.float32)
-        self.pairwise_delta_ts = torch.tensor(pairwise_delta_ts, dtype=torch.float32)
+        self.rosters = torch.from_numpy(rosters_arr[:count])
+        self.question_ids = torch.from_numpy(question_ids_arr[:count])
+        self.format_ids = torch.from_numpy(format_ids_arr[:count])
+        self.labels = torch.from_numpy(labels_arr[:count])
+        self.player_delta_ts = torch.from_numpy(player_deltas_arr[:count])
+        self.pairwise_delta_ts = torch.from_numpy(pairwise_deltas_arr[:count])
 
     def __len__(self) -> int:
         return len(self.labels)

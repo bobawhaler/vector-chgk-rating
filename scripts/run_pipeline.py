@@ -34,47 +34,52 @@ logger = logging.getLogger("pipeline")
 async def main() -> None:
     start_time = time.time()
     logger.info("=== Starting ChGK Rating Pipeline ===")
-    logger.info("Target: Historical data from 2020-01-01 to present")
 
-    # 1. Ingest historical data
-    ingest_config = DataIngestConfig(
-        parquet_path=DEFAULT_PARQUET_PATH,
-        max_requests_per_second=10.0,
-        timeout_seconds=20.0,
-        max_retries=4,
-    )
-    ingester = ChGKDataIngester(ingest_config)
+    # 1. Ingest historical data if not already present
+    if DEFAULT_PARQUET_PATH.exists() and DEFAULT_PARQUET_PATH.stat().st_size > 1000000:
+        logger.info("Found existing dataset at %s (size: %.1f MB). Loading...", DEFAULT_PARQUET_PATH, DEFAULT_PARQUET_PATH.stat().st_size / 1024 / 1024)
+        df = pd.read_parquet(DEFAULT_PARQUET_PATH)
+        logger.info("Successfully loaded %d records from disk.", len(df))
+    else:
+        logger.info("Target: Historical data from 2020-01-01 to present")
+        ingest_config = DataIngestConfig(
+            parquet_path=DEFAULT_PARQUET_PATH,
+            max_requests_per_second=10.0,
+            timeout_seconds=20.0,
+            max_retries=4,
+        )
+        ingester = ChGKDataIngester(ingest_config)
 
-    t0 = time.time()
-    logger.info("Fetching tournament list and results...")
+        t0 = time.time()
+        logger.info("Fetching tournament list and results...")
 
-    def progress_callback(msg: str, current: int, total: int) -> None:
-        elapsed = time.time() - t0
-        rate = current / max(elapsed, 0.1)
-        remaining_s = (total - current) / max(rate, 0.01)
-        if current % 50 == 0 or current == total:
-            logger.info(
-                "Progress: [%d/%d] (%.1f%%) | Rate: %.1f t/s | ETA: %.0fs | %s",
-                current,
-                total,
-                (current / total) * 100,
-                rate,
-                remaining_s,
-                msg,
-            )
+        def progress_callback(msg: str, current: int, total: int) -> None:
+            elapsed = time.time() - t0
+            rate = current / max(elapsed, 0.1)
+            remaining_s = (total - current) / max(rate, 0.01)
+            if current % 50 == 0 or current == total:
+                logger.info(
+                    "Progress: [%d/%d] (%.1f%%) | Rate: %.1f t/s | ETA: %.0fs | %s",
+                    current,
+                    total,
+                    (current / total) * 100,
+                    rate,
+                    remaining_s,
+                    msg,
+                )
 
-    df = await ingester.ingest_dataset(
-        start_date="2020-01-01",
-        end_date=datetime.now().strftime("%Y-%m-%d"),
-        progress_cb=progress_callback,
-    )
+        df = await ingester.ingest_dataset(
+            start_date="2020-01-01",
+            end_date=datetime.now().strftime("%Y-%m-%d"),
+            progress_cb=progress_callback,
+        )
 
-    fetch_duration = time.time() - t0
-    logger.info(
-        "Data ingestion finished in %.1f seconds. Total records: %d",
-        fetch_duration,
-        len(df),
-    )
+        fetch_duration = time.time() - t0
+        logger.info(
+            "Data ingestion finished in %.1f seconds. Total records: %d",
+            fetch_duration,
+            len(df),
+        )
 
     if df.empty:
         logger.error("Dataset is empty! Exiting.")
@@ -103,7 +108,7 @@ async def main() -> None:
         config=model_config,
         parquet_path=DEFAULT_PARQUET_PATH,
         model_save_path=DEFAULT_MODEL_PATH,
-        metadata_save_path=DEFAULT_META_PATH,
+        meta_save_path=DEFAULT_META_PATH,
     )
     train_duration = time.time() - t_train_start
     logger.info("Training completed in %.1f seconds.", train_duration)
