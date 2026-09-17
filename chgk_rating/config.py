@@ -77,4 +77,4 @@ class GotQuestionsConfig:
     max_requests_per_second: float = 2.0  # Polite rate limit to never overload community server
     timeout_seconds: float = 15.0
     max_retries: int = 4
-    consecutive_404_stop: int = 5  # Stop scanning when N consecutive packs return 404
+    consecutive_404_stop: int = 30  # Stop scanning when N consecutive packs return 404

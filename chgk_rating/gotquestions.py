@@ -23,6 +23,8 @@ from chgk_rating.config import (
     GotQuestionsConfig,
 )
 
+from chgk_rating.data_loader import AsyncRateLimiter
+
 logger = logging.getLogger(__name__)
 
 
@@ -194,7 +196,7 @@ class GotQuestionsIngester:
     def __init__(self, config: Optional[GotQuestionsConfig] = None) -> None:
         self.config = config or GotQuestionsConfig()
         self.cache = GotQuestionsCache(self.config.cache_db_path)
-        self.delay_between_requests = 1.0 / max(self.config.max_requests_per_second, 0.5)
+        self.rate_limiter = AsyncRateLimiter(max_per_second=self.config.max_requests_per_second)
 
     async def fetch_pack(
         self,
@@ -207,6 +209,8 @@ class GotQuestionsIngester:
             cached = self.cache.get_pack(pack_id)
             if cached is not None:
                 return cached
+            if self.cache.is_known_not_found(pack_id):
+                return None
 
         url = f"{self.config.base_url}/pack/{pack_id}"
         headers = {
@@ -218,7 +222,7 @@ class GotQuestionsIngester:
         retries = 0
         backoff = 1.0
         while retries <= self.config.max_retries:
-            await asyncio.sleep(self.delay_between_requests)
+            await self.rate_limiter.acquire()
             try:
                 resp = await client.get(
                     url,
@@ -269,6 +273,8 @@ class GotQuestionsIngester:
         self,
         lookback_packs: int = 50,
         max_packs: Optional[int] = None,
+        target_max_pack: Optional[int] = None,
+        concurrency: int = 2,
         progress_cb: Optional[Callable[[str, int, int], None]] = None,
     ) -> int:
         """Run incremental sync: rescan recent packs and discover all new packs until 404 stop."""
@@ -286,13 +292,14 @@ class GotQuestionsIngester:
         consecutive_404s = 0
         current_id = start_id
         fetched_new = 0
+        sem = asyncio.Semaphore(concurrency)
 
         async with httpx.AsyncClient() as client:
             while True:
                 if max_packs is not None and fetched_new >= max_packs:
                     break
-
-                # If we are past known packs and hit consecutive 404s, stop
+                if target_max_pack is not None and current_id > target_max_pack:
+                    break
                 if current_id > max_known and consecutive_404s >= self.config.consecutive_404_stop:
                     logger.info(
                         "Reached %d consecutive 404s at pack %d. Halting crawl.",
@@ -301,27 +308,61 @@ class GotQuestionsIngester:
                     )
                     break
 
-                # Rescan or fetch pack
-                is_rescan = current_id <= max_known
-                pack = await self.fetch_pack(client, current_id, use_cache=is_rescan)
+                chunk_size = min(10, concurrency * 5)
+                if max_packs is not None:
+                    chunk_size = min(chunk_size, max_packs - fetched_new)
+                if target_max_pack is not None:
+                    chunk_size = min(chunk_size, target_max_pack - current_id + 1)
 
-                if pack is not None:
-                    consecutive_404s = 0
-                    fetched_new += 1
-                    t_ids = pack.get("tIds", [])
-                    t_count = len(pack.get("tours", []))
-                    if progress_cb and (fetched_new % 10 == 0 or fetched_new == 1):
-                        progress_cb(
-                            f"Pack #{current_id}: '{pack.get('title', '')[:30]}' ({t_count} tours, tIds: {t_ids})",
-                            current_id,
-                            max_known + fetched_new,
-                        )
-                else:
-                    if current_id > max_known:
-                        consecutive_404s += 1
+                pids = list(range(current_id, current_id + chunk_size))
+                if not pids:
+                    break
 
-                current_id += 1
+                async def fetch_one(pid: int) -> Tuple[int, Optional[Dict[str, Any]]]:
+                    async with sem:
+                        is_rescan = pid <= max_known
+                        p = await self.fetch_pack(client, pid, use_cache=is_rescan)
+                        return pid, p
 
+                tasks = [fetch_one(pid) for pid in pids]
+                results = await asyncio.gather(*tasks)
+
+                stopped_early = False
+                for pid, pack in results:
+                    if pack is not None:
+                        consecutive_404s = 0
+                        fetched_new += 1
+                        t_ids = pack.get("tIds", [])
+                        t_count = len(pack.get("tours", []))
+                        if progress_cb and (fetched_new % 10 == 0 or fetched_new == 1):
+                            progress_cb(
+                                f"Pack #{pid}: '{pack.get('title', '')[:30]}' ({t_count} tours, tIds: {t_ids})",
+                                pid,
+                                max_known + fetched_new,
+                            )
+                    else:
+                        if pid > max_known:
+                            consecutive_404s += 1
+                            if consecutive_404s >= self.config.consecutive_404_stop:
+                                stopped_early = True
+                                current_id = pid + 1
+                                break
+
+                # Periodically checkpoint export every 200 packs
+                if fetched_new > 0 and fetched_new % 200 == 0:
+                    self.export_to_parquet()
+
+                if stopped_early:
+                    logger.info(
+                        "Reached %d consecutive 404s at pack %d. Halting crawl.",
+                        consecutive_404s,
+                        current_id,
+                    )
+                    break
+
+                current_id = pids[-1] + 1
+
+        self.export_to_parquet()
         logger.info("Incremental sync finished. Saved packs in cache: %d", self.cache.get_saved_pack_count())
         return fetched_new
 

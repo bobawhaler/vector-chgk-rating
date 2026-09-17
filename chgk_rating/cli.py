@@ -459,9 +459,17 @@ def update_rating(since_date: Optional[str], lookback_days: int, data_path: str)
 
 @cli.command("fetch-questions")
 @click.option("--lookback-packs", default=50, type=int, help="Recent packs to re-check during incremental crawl")
-@click.option("--max-packs", default=None, type=int, help="Max packs to fetch (None for all until 404 boundary)")
+@click.option("--max-packs", default=None, type=int, help="Max packs to fetch (None for all until boundary)")
+@click.option("--target-max-pack", default=7125, type=int, help="Known upper bound pack ID on gotquestions")
 @click.option("--rate-limit", default=2.0, type=float, help="Requests per second (polite default 2.0)")
-def fetch_questions(lookback_packs: int, max_packs: Optional[int], rate_limit: float) -> None:
+@click.option("--concurrency", default=2, type=int, help="Concurrent workers (default 2)")
+def fetch_questions(
+    lookback_packs: int,
+    max_packs: Optional[int],
+    target_max_pack: Optional[int],
+    rate_limit: float,
+    concurrency: int,
+) -> None:
     """Politely fetch question packages, authors, and tour editors from gotquestions.online."""
     from chgk_rating.config import GotQuestionsConfig
     from chgk_rating.gotquestions import GotQuestionsIngester
@@ -472,11 +480,16 @@ def fetch_questions(lookback_packs: int, max_packs: Optional[int], rate_limit: f
     def progress_callback(msg: str, current: int, total: int) -> None:
         click.echo(f"[{current}] {msg}")
 
-    click.echo(f"Starting polite gotquestions ingestion (rate limit: {rate_limit} req/s)...")
+    click.echo(
+        f"Starting polite gotquestions ingestion (rate limit: {rate_limit} req/s, "
+        f"concurrency: {concurrency}, target max pack: {target_max_pack})..."
+    )
     fetched = asyncio.run(
         ingester.ingest_incremental(
             lookback_packs=lookback_packs,
             max_packs=max_packs,
+            target_max_pack=target_max_pack,
+            concurrency=concurrency,
             progress_cb=progress_callback,
         )
     )
