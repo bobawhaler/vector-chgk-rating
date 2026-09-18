@@ -37,7 +37,7 @@ def load_model_and_metadata(
 
     model = DualEmbeddingChGKModel(
         num_players=cfg.get("num_players", len(metadata.player_indexer) + 1),
-        num_questions=cfg.get("num_questions", len(metadata.question_indexer)),
+        num_editors=cfg.get("num_editors", len(metadata.editor_indexer) + 1),
         dim_k=cfg.get("dim_k", 16),
         dim_c=cfg.get("dim_c", 8),
         num_formats=cfg.get("num_formats", 3),
@@ -338,9 +338,20 @@ def export_embeddings_to_parquet(
         c_base_w = model.player_c_base.weight.cpu().numpy()
         c_delta_w = model.player_c_delta.weight.cpu().numpy()
 
-        q_w = model.question_q_emb.weight.cpu().numpy()
-        b_w = model.question_b.weight.cpu().numpy().squeeze(-1)
-        a_w = model.question_a.cpu().numpy().squeeze(-1)
+        has_editors = hasattr(model, "editor_emb")
+        if has_editors:
+            ed_w = model.editor_emb.weight.cpu().numpy()
+            ed_b = model.editor_b.weight.cpu().numpy().squeeze(-1)
+        else:
+            ed_w, ed_b = None, None
+
+        has_questions = hasattr(model, "question_q_emb")
+        if has_questions:
+            q_w = model.question_q_emb.weight.cpu().numpy()
+            b_w = model.question_b.weight.cpu().numpy().squeeze(-1)
+            a_w = model.question_a.cpu().numpy().squeeze(-1)
+        else:
+            q_w, b_w, a_w = None, None, None
 
     # 1. Player embeddings table
     player_rows: List[Dict[str, Any]] = []
@@ -371,35 +382,64 @@ def export_embeddings_to_parquet(
     p_df.to_parquet(p_parquet, index=False)
     p_df.to_csv(p_csv, index=False)
 
-    # 2. Question embeddings table
-    question_rows: List[Dict[str, Any]] = []
-    for raw_q, idx in q_indexer.item_to_idx.items():
-        if idx < len(q_w):
-            q_vec = q_w[idx]
-            row = {
-                "question_id": raw_q,
-                "question_idx": idx,
-                "difficulty_bias": float(b_w[idx]),
-                "discrimination_a": float(a_w[idx]),
-                "requirement_norm": float(np.linalg.norm(q_vec)),
-            }
-            for d in range(len(q_vec)):
-                row[f"q_{d}"] = float(q_vec[d])
-            question_rows.append(row)
-
-    q_df = pd.DataFrame(question_rows)
-    q_parquet = output_dir / "question_embeddings.parquet"
-    q_csv = output_dir / "question_embeddings.csv"
-    q_df.to_parquet(q_parquet, index=False)
-    q_df.to_csv(q_csv, index=False)
-
-    logger.info("Exported embeddings to %s", output_dir)
-    return {
+    exported_paths = {
         "player_parquet": p_parquet,
         "player_csv": p_csv,
-        "question_parquet": q_parquet,
-        "question_csv": q_csv,
     }
+
+    # 2. Editor embeddings table
+    if has_editors and metadata.editor_indexer:
+        ed_rows: List[Dict[str, Any]] = []
+        for raw_ed, idx in metadata.editor_indexer.item_to_idx.items():
+            if idx < len(ed_w):
+                e_vec = ed_w[idx]
+                ed_row = {
+                    "editor_id": raw_ed,
+                    "editor_idx": idx,
+                    "difficulty_bias": float(ed_b[idx]),
+                    "style_norm": float(np.linalg.norm(e_vec)),
+                }
+                for d in range(len(e_vec)):
+                    ed_row[f"ed_{d}"] = float(e_vec[d])
+                ed_rows.append(ed_row)
+        ed_df = pd.DataFrame(ed_rows)
+        ed_parquet = output_dir / "editor_embeddings.parquet"
+        ed_csv = output_dir / "editor_embeddings.csv"
+        ed_df.to_parquet(ed_parquet, index=False)
+        ed_df.to_csv(ed_csv, index=False)
+        exported_paths["editor_parquet"] = ed_parquet
+        exported_paths["editor_csv"] = ed_csv
+        # Also alias as question_parquet / question_csv for backward compatibility
+        exported_paths["question_parquet"] = ed_parquet
+        exported_paths["question_csv"] = ed_csv
+
+    # 3. Question embeddings table (if legacy model)
+    elif has_questions and q_indexer:
+        question_rows: List[Dict[str, Any]] = []
+        for raw_q, idx in q_indexer.item_to_idx.items():
+            if idx < len(q_w):
+                q_vec = q_w[idx]
+                row = {
+                    "question_id": raw_q,
+                    "question_idx": idx,
+                    "difficulty_bias": float(b_w[idx]),
+                    "discrimination_a": float(a_w[idx]),
+                    "requirement_norm": float(np.linalg.norm(q_vec)),
+                }
+                for d in range(len(q_vec)):
+                    row[f"q_{d}"] = float(q_vec[d])
+                question_rows.append(row)
+
+        q_df = pd.DataFrame(question_rows)
+        q_parquet = output_dir / "question_embeddings.parquet"
+        q_csv = output_dir / "question_embeddings.csv"
+        q_df.to_parquet(q_parquet, index=False)
+        q_df.to_csv(q_csv, index=False)
+        exported_paths["question_parquet"] = q_parquet
+        exported_paths["question_csv"] = q_csv
+
+    logger.info("Exported embeddings to %s", output_dir)
+    return exported_paths
 
 
 def get_format_analysis(
@@ -444,4 +484,268 @@ def get_format_analysis(
         "formats": formats,
         "format_names": [ID_TO_FORMAT.get(i, str(i)) for i in range(num_f)],
         "cosine_similarity_matrix": pairwise_matrix,
+    }
+
+
+def predict_team_match(
+    model: DualEmbeddingChGKModel,
+    metadata: DatasetMetadata,
+    team_a_players: List[Union[int, str]],
+    team_b_players: List[Union[int, str]],
+    format_name: str = FORMAT_OFFLINE,
+    target_dl: Optional[float] = None,
+    editor_ids: Optional[List[int]] = None,
+    num_questions: int = 36,
+    num_simulations: int = 5000,
+) -> Dict[str, Any]:
+    """Simulate head-to-head match between two team rosters given editor calibrated DL."""
+    from chgk_rating.editor_analytics import get_editor_registry
+
+    reg = get_editor_registry()
+    calibrated_dl = reg.predict_tournament_truedl(forecast_dl=target_dl, editor_ids=editor_ids)
+
+    # Calibrated TrueDL difficulty anchor for question difficulty
+    expected_b = 0.1835 * calibrated_dl
+
+    p_indexer = metadata.player_indexer
+    ed_indexer = metadata.editor_indexer
+    fmt_id = metadata.format_map.get(format_name.lower(), 0)
+
+    # Encode editor IDs
+    mapped_e = []
+    if editor_ids:
+        for e in editor_ids:
+            e_idx = ed_indexer.get_idx(str(e), default=0)
+            if e_idx > 0:
+                mapped_e.append(e_idx)
+    if not mapped_e:
+        mapped_e = [0]
+    e_ten = torch.tensor([mapped_e], dtype=torch.long)
+
+    def get_team_tensor(players: List[Union[int, str]]) -> torch.Tensor:
+        indices = [p_indexer.get_idx(p, default=0) for p in players[:6]]
+        while len(indices) < 6:
+            indices.append(0)
+        return torch.tensor([indices], dtype=torch.long)
+
+    t_a_ten = get_team_tensor(team_a_players)
+    t_b_ten = get_team_tensor(team_b_players)
+    f_ten = torch.tensor([fmt_id], dtype=torch.long)
+    b_ten = torch.tensor([[expected_b]], dtype=torch.float32)
+
+    with torch.no_grad():
+        out_a = model(player_ids=t_a_ten, editor_ids=e_ten, format_ids=f_ten, expected_difficulty=b_ten)
+        out_b = model(player_ids=t_b_ten, editor_ids=e_ten, format_ids=f_ten, expected_difficulty=b_ten)
+        p_a = float(out_a["probs"][0, 0].item())
+        p_b = float(out_b["probs"][0, 0].item())
+
+    # Monte Carlo simulation of match scores
+    scores_a = np.random.binomial(num_questions, p_a, size=num_simulations)
+    scores_b = np.random.binomial(num_questions, p_b, size=num_simulations)
+
+    p_a_wins = float(np.mean(scores_a > scores_b))
+    p_b_wins = float(np.mean(scores_b > scores_a))
+    p_tie = float(np.mean(scores_a == scores_b))
+
+    return {
+        "calibrated_dl": round(calibrated_dl, 2),
+        "target_dl": target_dl,
+        "editor_ids": editor_ids or [],
+        "team_a_solve_prob": round(p_a, 4),
+        "team_b_solve_prob": round(p_b, 4),
+        "team_a_expected_score": round(p_a * num_questions, 2),
+        "team_b_expected_score": round(p_b * num_questions, 2),
+        "prob_team_a_wins": round(p_a_wins, 4),
+        "prob_team_b_wins": round(p_b_wins, 4),
+        "prob_tie": round(p_tie, 4),
+        "num_questions": num_questions,
+    }
+
+
+def simulate_tournament(
+    model: DualEmbeddingChGKModel,
+    metadata: DatasetMetadata,
+    teams: Dict[str, List[Union[int, str]]],
+    format_name: str = FORMAT_OFFLINE,
+    target_dl: Optional[float] = None,
+    editor_ids: Optional[List[int]] = None,
+    num_questions: int = 36,
+    num_simulations: int = 2000,
+) -> Dict[str, Any]:
+    """Simulate a tournament with multiple teams and compute expected standings and win matrices."""
+    from chgk_rating.editor_analytics import get_editor_registry
+
+    reg = get_editor_registry()
+    calibrated_dl, std_dl = reg.predict_tournament_dl_distribution(
+        forecast_dl=target_dl, editor_ids=editor_ids
+    )
+    expected_b = 0.1835 * calibrated_dl
+
+    p_indexer = metadata.player_indexer
+    ed_indexer = metadata.editor_indexer
+    fmt_id = metadata.format_map.get(format_name.lower(), 0)
+    f_ten = torch.tensor([fmt_id], dtype=torch.long)
+    b_ten = torch.tensor([[expected_b]], dtype=torch.float32)
+
+    mapped_e = []
+    if editor_ids:
+        for e in editor_ids:
+            e_idx = ed_indexer.get_idx(str(e), default=0)
+            if e_idx > 0:
+                mapped_e.append(e_idx)
+    if not mapped_e:
+        mapped_e = [0]
+    e_ten = torch.tensor([mapped_e], dtype=torch.long)
+
+    team_names = list(teams.keys())
+    solve_probs = {}
+
+    with torch.no_grad():
+        for name, players in teams.items():
+            valid_p = [str(p) for p in players[:6]]
+            indices = [p_indexer.get_idx(p, default=0) for p in valid_p]
+            while len(indices) < 6:
+                indices.append(0)
+            p_ten = torch.tensor([indices], dtype=torch.long)
+
+            # Extract experience matrix from metadata.pair_games_count
+            exp_mat = np.zeros((1, 6, 6), dtype=np.float32)
+            n_p = len(valid_p)
+            for i in range(n_p):
+                for m in range(n_p):
+                    if i != m:
+                        p1, p2 = sorted([valid_p[i], valid_p[m]])
+                        k_pair = f"{p1}_{p2}"
+                        n_g = metadata.pair_games_count.get(k_pair, 0)
+                        exp_mat[0, i, m] = float(np.log1p(n_g))
+            exp_ten = torch.tensor(exp_mat, dtype=torch.float32)
+
+            out = model(
+                player_ids=p_ten,
+                editor_ids=e_ten,
+                format_ids=f_ten,
+                pairwise_exp=exp_ten,
+                expected_difficulty=b_ten,
+            )
+            solve_probs[name] = float(out["probs"][0, 0].item())
+
+    # Monte Carlo simulation of tournament standings with editor variance
+    # Rather than fixed p, package difficulty has variance std_dl across simulation draws
+    all_scores = np.zeros((num_simulations, len(team_names)), dtype=np.int32)
+    for s in range(num_simulations):
+        # Sample package difficulty shift: ~ N(0, (0.1835 * std_dl)^2)
+        b_shift = np.random.normal(0.0, 0.1835 * std_dl * 0.3)
+        for idx, name in enumerate(team_names):
+            # shift probability through logit
+            base_p = solve_probs[name]
+            base_logit = np.log(base_p / max(1e-6, 1.0 - base_p))
+            sim_p = 1.0 / (1.0 + np.exp(-(base_logit - b_shift)))
+            all_scores[s, idx] = np.random.binomial(num_questions, sim_p)
+
+    # Compute expected places (ranks)
+    ranks = np.zeros_like(all_scores, dtype=np.float32)
+    from scipy.stats import rankdata
+    for s in range(num_simulations):
+        ranks[s] = rankdata(-all_scores[s], method="average")
+
+    standings = []
+    for idx, name in enumerate(team_names):
+        standings.append({
+            "team_name": name,
+            "solve_prob": round(solve_probs[name], 4),
+            "expected_score": round(solve_probs[name] * num_questions, 2),
+            "mean_rank": round(float(np.mean(ranks[:, idx])), 2),
+            "prob_1st_place": round(float(np.mean(ranks[:, idx] <= 1.5)), 4),
+            "prob_top_3": round(float(np.mean(ranks[:, idx] <= 3.5)), 4),
+        })
+
+    standings.sort(key=lambda x: x["mean_rank"])
+
+    return {
+        "calibrated_dl": round(calibrated_dl, 2),
+        "target_dl": target_dl,
+        "editor_ids": editor_ids or [],
+        "package_difficulty_std": round(std_dl, 2),
+        "num_questions": num_questions,
+        "standings": standings,
+    }
+
+
+def compute_player_marginal_contribution(
+    model: DualEmbeddingChGKModel,
+    metadata: DatasetMetadata,
+    player_id: Union[int, str],
+    teammates: List[Union[int, str]],
+    format_name: str = FORMAT_OFFLINE,
+    target_dl: Optional[float] = None,
+    editor_ids: Optional[List[int]] = None,
+    num_questions: int = 36,
+) -> Dict[str, Any]:
+    """Compute an individual player's pure marginal value added (Shapley / leave-one-out) to a roster.
+
+    Marginal Contribution = P(team with player) - P(team without player).
+    Positive values mean the player actively expands the team's coverage.
+    Near-zero values mean the player's knowledge is already fully covered by the partners.
+    """
+    model.eval()
+    p_indexer = metadata.player_indexer
+    ed_indexer = metadata.editor_indexer
+    fmt_id = metadata.format_map.get(format_name.lower(), 0)
+    f_ten = torch.tensor([fmt_id], dtype=torch.long)
+
+    from chgk_rating.editor_analytics import get_editor_registry
+    reg = get_editor_registry()
+    calibrated_dl = reg.predict_tournament_truedl(forecast_dl=target_dl, editor_ids=editor_ids)
+    b_ten = torch.tensor([[0.1835 * calibrated_dl]], dtype=torch.float32)
+
+    mapped_e = []
+    if editor_ids:
+        for e in editor_ids:
+            e_idx = ed_indexer.get_idx(str(e), default=0)
+            if e_idx > 0:
+                mapped_e.append(e_idx)
+    if not mapped_e:
+        mapped_e = [0]
+    e_ten = torch.tensor([mapped_e], dtype=torch.long)
+
+    # 1. Full team (player + teammates up to 5)
+    full_roster = [str(player_id)] + [str(t) for t in teammates[:5]]
+    indices_full = [p_indexer.get_idx(p, default=0) for p in full_roster]
+    while len(indices_full) < 6:
+        indices_full.append(0)
+    full_ten = torch.tensor([indices_full], dtype=torch.long)
+
+    # 2. Team without player (teammates only)
+    without_roster = [str(t) for t in teammates[:5]]
+    indices_without = [p_indexer.get_idx(p, default=0) for p in without_roster]
+    while len(indices_without) < 6:
+        indices_without.append(0)
+    without_ten = torch.tensor([indices_without], dtype=torch.long)
+
+    # 3. Solo player (player playing alone)
+    indices_solo = [p_indexer.get_idx(str(player_id), default=0)] + [0] * 5
+    solo_ten = torch.tensor([indices_solo], dtype=torch.long)
+
+    with torch.no_grad():
+        out_full = model(player_ids=full_ten, editor_ids=e_ten, format_ids=f_ten, expected_difficulty=b_ten)
+        out_without = model(player_ids=without_ten, editor_ids=e_ten, format_ids=f_ten, expected_difficulty=b_ten)
+        out_solo = model(player_ids=solo_ten, editor_ids=e_ten, format_ids=f_ten, expected_difficulty=b_ten)
+
+        p_full = float(out_full["probs"][0, 0].item())
+        p_without = float(out_without["probs"][0, 0].item())
+        p_solo = float(out_solo["probs"][0, 0].item())
+
+    marginal_prob_gain = p_full - p_without
+    marginal_score_gain = marginal_prob_gain * num_questions
+
+    return {
+        "player_id": str(player_id),
+        "format": format_name,
+        "team_size": len(full_roster),
+        "full_team_solve_prob": round(p_full, 4),
+        "without_player_solve_prob": round(p_without, 4),
+        "solo_player_solve_prob": round(p_solo, 4),
+        "marginal_probability_gain": round(marginal_prob_gain, 4),
+        "marginal_questions_gained": round(marginal_score_gain, 2),
+        "calibrated_dl": round(calibrated_dl, 2),
     }

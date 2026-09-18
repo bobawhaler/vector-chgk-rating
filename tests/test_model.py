@@ -11,13 +11,13 @@ from chgk_rating.model import DualEmbeddingChGKModel
 
 def test_model_initialization() -> None:
     num_players = 50
-    num_questions = 100
+    num_editors = 20
     dim_k = 16
     dim_c = 8
 
     model = DualEmbeddingChGKModel(
         num_players=num_players,
-        num_questions=num_questions,
+        num_editors=num_editors,
         dim_k=dim_k,
         dim_c=dim_c,
     )
@@ -25,29 +25,27 @@ def test_model_initialization() -> None:
     assert model.player_k_emb.weight.shape == (num_players, dim_k)
     assert model.player_c_base.weight.shape == (num_players, dim_c)
     assert model.player_c_delta.weight.shape == (num_players, dim_c)
-    assert model.question_q_emb.weight.shape == (num_questions, dim_k)
-    assert model.question_b.weight.shape == (num_questions, 1)
-    assert model.question_a_raw.weight.shape == (num_questions, 1)
+    assert model.editor_emb.weight.shape == (num_editors, dim_k)
+    assert model.editor_b.weight.shape == (num_editors, 1)
     assert model.W_synergy.shape == (dim_c, dim_c)
 
     # Padding index 0 must be strictly zero
     assert torch.all(model.player_k_emb.weight[0] == 0.0)
     assert torch.all(model.player_c_base.weight[0] == 0.0)
     assert torch.all(model.player_c_delta.weight[0] == 0.0)
-
-    # Discrimination factor via softplus must be strictly positive
-    assert torch.all(model.question_a > 0.0)
+    assert torch.all(model.editor_emb.weight[0] == 0.0)
+    assert torch.all(model.editor_b.weight[0] == 0.0)
 
 
 def test_forward_pass_shapes_and_values() -> None:
     batch_size = 4
     k_players = 6
     num_players = 30
-    num_questions = 20
+    num_editors = 15
 
     model = DualEmbeddingChGKModel(
         num_players=num_players,
-        num_questions=num_questions,
+        num_editors=num_editors,
         dim_k=8,
         dim_c=4,
     )
@@ -59,10 +57,10 @@ def test_forward_pass_shapes_and_values() -> None:
         [17, 18, 19, 20, 21, 22],
     ], dtype=torch.long)
 
-    question_ids = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+    editor_ids = torch.tensor([[1, 2], [3, 0], [4, 5], [0, 0]], dtype=torch.long)
     format_ids = torch.tensor([0, 1, 2, 0], dtype=torch.long)
 
-    out = model(player_ids, question_ids, format_ids)
+    out = model(player_ids=player_ids, editor_ids=editor_ids, format_ids=format_ids)
 
     assert out["logits"].shape == (batch_size, 1)
     assert out["probs"].shape == (batch_size, 1)
@@ -81,7 +79,7 @@ def test_forward_pass_shapes_and_values() -> None:
 def test_team_knowledge_pooling() -> None:
     model = DualEmbeddingChGKModel(
         num_players=10,
-        num_questions=5,
+        num_editors=5,
         dim_k=4,
         dim_c=2,
     )
@@ -93,7 +91,7 @@ def test_team_knowledge_pooling() -> None:
         model.player_k_emb.weight[0] = torch.tensor([0.0, 0.0, 0.0, 0.0])  # padding
 
     player_ids = torch.tensor([[1, 2, 0, 0, 0, 0]], dtype=torch.long)
-    question_ids = torch.tensor([0], dtype=torch.long)
+    editor_ids = torch.tensor([[1]], dtype=torch.long)
     format_ids = torch.tensor([0], dtype=torch.long)
 
     # Team max pooling should be max(k_1, k_2): [2.0, 0.0, 5.0, 4.0]
@@ -110,7 +108,7 @@ def test_team_knowledge_pooling() -> None:
 def test_pairwise_synergy_computation() -> None:
     model = DualEmbeddingChGKModel(
         num_players=10,
-        num_questions=5,
+        num_editors=5,
         dim_k=4,
         dim_c=2,
     )
@@ -140,26 +138,25 @@ def test_pairwise_synergy_computation() -> None:
 
 
 def test_gradient_flow_and_regularization() -> None:
-    model = DualEmbeddingChGKModel(num_players=20, num_questions=10, dim_k=4, dim_c=2)
+    model = DualEmbeddingChGKModel(num_players=20, num_editors=10, dim_k=4, dim_c=2)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
     criterion = nn.BCEWithLogitsLoss()
 
     player_ids = torch.tensor([[1, 2, 3, 4, 5, 6]], dtype=torch.long)
-    question_ids = torch.tensor([2], dtype=torch.long)
+    editor_ids = torch.tensor([[2]], dtype=torch.long)
     format_ids = torch.tensor([1], dtype=torch.long)
     target = torch.tensor([[1.0]])
 
     optimizer.zero_grad()
-    out = model(player_ids, question_ids, format_ids)
+    out = model(player_ids=player_ids, editor_ids=editor_ids, format_ids=format_ids)
     loss = criterion(out["logits"], target) + 1e-4 * model.compute_l2_regularization()
     loss.backward()
 
     # Verify gradients are non-zero for active parameters
     assert model.player_k_emb.weight.grad is not None
     assert model.player_c_base.weight.grad is not None
-    assert model.question_q_emb.weight.grad is not None
-    assert model.question_b.weight.grad is not None
-    assert model.question_a_raw.weight.grad is not None
+    assert model.editor_emb.weight.grad is not None
+    assert model.editor_b.weight.grad is not None
     assert model.W_synergy.grad is not None
 
     optimizer.step()

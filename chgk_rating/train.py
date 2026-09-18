@@ -66,7 +66,7 @@ def evaluate_model(
     with torch.no_grad():
         for batch in dataloader:
             player_ids = batch["player_ids"].to(device)
-            question_id = batch["question_id"].to(device)
+            editor_ids = batch["editor_ids"].to(device)
             format_id = batch["format_id"].to(device)
             labels = batch["label"].to(device)
             player_delta_t = batch.get("player_delta_t")
@@ -75,13 +75,17 @@ def evaluate_model(
             pairwise_delta_t = batch.get("pairwise_delta_t")
             if pairwise_delta_t is not None:
                 pairwise_delta_t = pairwise_delta_t.to(device)
+            pairwise_exp = batch.get("pairwise_exp")
+            if pairwise_exp is not None:
+                pairwise_exp = pairwise_exp.to(device)
 
             out = model(
-                player_ids,
-                question_id,
-                format_id,
+                player_ids=player_ids,
+                editor_ids=editor_ids,
+                format_ids=format_id,
                 player_delta_t=player_delta_t,
                 pairwise_delta_t=pairwise_delta_t,
+                pairwise_exp=pairwise_exp,
             )
             probs = out["probs"].squeeze(-1).cpu().numpy().tolist()
             targets = labels.squeeze(-1).cpu().numpy().tolist()
@@ -125,7 +129,6 @@ def train_model(
     train_df, val_df, test_df = split_data_chronologically(df)
 
     # 2. Build indexers
-    # Player indexing starts at 1; 0 is reserved for padding
     all_players: set[str] = set()
     for plist in df["player_ids"]:
         if isinstance(plist, (list, np.ndarray)):
@@ -135,16 +138,35 @@ def train_model(
     player_indexer = IDIndexer(start_idx=1)
     player_indexer.fit(sorted(list(all_players)))
 
-    question_indexer = IDIndexer(start_idx=0)
-    question_indexer.fit(sorted(list(df["question_id"].astype(str).unique())))
+    # Build editor indexer from tournament cache
+    from chgk_rating.editor_analytics import get_editor_registry
+    reg = get_editor_registry()
+    reg.load_data()
 
-    metadata = DatasetMetadata(player_indexer, question_indexer)
+    all_editors: set[str] = set()
+    tournament_editors_map: Dict[int, List[int]] = {}
+    for tid, meta in reg._tournament_metadata.items():
+        ed_list = meta.get("editor_ids", [])
+        tournament_editors_map[tid] = ed_list
+        for e in ed_list:
+            all_editors.add(str(e))
+
+    editor_indexer = IDIndexer(start_idx=1)
+    editor_indexer.fit(sorted(list(all_editors)))
+
+    question_indexer = IDIndexer(start_idx=0)
+
+    metadata = DatasetMetadata(
+        player_indexer=player_indexer,
+        editor_indexer=editor_indexer,
+        question_indexer=question_indexer,
+    )
     metadata.save(meta_save_path)
 
     # 3. Create datasets & dataloaders
-    train_dataset = ChGKDataset(train_df, metadata)
-    val_dataset = ChGKDataset(val_df, metadata)
-    test_dataset = ChGKDataset(test_df, metadata)
+    train_dataset = ChGKDataset(train_df, metadata, tournament_editors_map=tournament_editors_map)
+    val_dataset = ChGKDataset(val_df, metadata, tournament_editors_map=tournament_editors_map)
+    test_dataset = ChGKDataset(test_df, metadata, tournament_editors_map=tournament_editors_map)
 
     train_loader = DataLoader(
         train_dataset, batch_size=cfg.batch_size, shuffle=True, drop_last=False
@@ -158,8 +180,8 @@ def train_model(
 
     # 4. Instantiate model
     model = DualEmbeddingChGKModel(
-        num_players=len(player_indexer) + 1,  # account for 0 padding
-        num_questions=len(question_indexer),
+        num_players=len(player_indexer) + 1,
+        num_editors=len(editor_indexer) + 1,
         dim_k=cfg.dim_k,
         dim_c=cfg.dim_c,
         num_formats=cfg.num_formats,
@@ -183,7 +205,7 @@ def train_model(
 
         for batch in train_loader:
             player_ids = batch["player_ids"].to(device)
-            question_id = batch["question_id"].to(device)
+            editor_ids = batch["editor_ids"].to(device)
             format_id = batch["format_id"].to(device)
             labels = batch["label"].to(device)
             player_delta_t = batch.get("player_delta_t")
@@ -192,16 +214,42 @@ def train_model(
             pairwise_delta_t = batch.get("pairwise_delta_t")
             if pairwise_delta_t is not None:
                 pairwise_delta_t = pairwise_delta_t.to(device)
+            pairwise_exp = batch.get("pairwise_exp")
+            if pairwise_exp is not None:
+                pairwise_exp = pairwise_exp.to(device)
 
             optimizer.zero_grad()
             out = model(
-                player_ids,
-                question_id,
-                format_id,
+                player_ids=player_ids,
+                editor_ids=editor_ids,
+                format_ids=format_id,
                 player_delta_t=player_delta_t,
                 pairwise_delta_t=pairwise_delta_t,
+                pairwise_exp=pairwise_exp,
             )
-            loss = criterion(out["logits"], labels)
+            logits = out["logits"]
+            bce_loss = criterion(logits, labels)
+
+            # In-batch pairwise / listwise ranking loss
+            if cfg.rank_loss_weight > 0.0:
+                sub_n = min(256, logits.size(0))
+                sub_logits = logits[:sub_n]
+                sub_labels = labels[:sub_n]
+                delta_y = sub_labels - sub_labels.t()
+                delta_l = sub_logits - sub_logits.t()
+                pos_mask = delta_y > 0
+                if pos_mask.any():
+                    # Logistic rank loss scaled by margin
+                    rank_loss = torch.log1p(torch.exp(-delta_l))[pos_mask].mean()
+                else:
+                    rank_loss = torch.tensor(0.0, device=device)
+                loss = bce_loss + cfg.rank_loss_weight * rank_loss
+            else:
+                loss = bce_loss
+
+            # Apply Bayesian shrinkage & explicit L2 regularizer
+            reg_loss = model.compute_l2_regularization() * (cfg.weight_decay * 1e-3)
+            loss = loss + reg_loss
 
             loss.backward()
             optimizer.step()
@@ -237,7 +285,7 @@ def train_model(
                         "dim_k": cfg.dim_k,
                         "dim_c": cfg.dim_c,
                         "num_players": len(player_indexer) + 1,
-                        "num_questions": len(question_indexer),
+                        "num_editors": len(editor_indexer) + 1,
                         "num_formats": cfg.num_formats,
                     },
                 },

@@ -171,15 +171,46 @@ class AsyncRateLimiter:
             self.last_request_time = loop.time()
 
 
+ONLINE_KEYWORDS = (
+    "онлайн",
+    "online",
+    "дискорд",
+    "discord",
+    "zoom",
+    "зум",
+    "интернет",
+    "skype",
+    "скайп",
+)
+
+
+def is_online_venue(venue_name: Optional[str]) -> bool:
+    """Check if venue/platform name corresponds to online remote play."""
+    if not venue_name:
+        return False
+    v_lower = venue_name.lower()
+    return any(k in v_lower for k in ONLINE_KEYWORDS)
+
+
 def normalize_tournament_format(type_name: str, title: str) -> str:
     """Normalize ChGK tournament type to offline, sync, or online."""
     combined = f"{type_name} {title}".lower()
-    if any(k in combined for k in ["онлайн", "online", "дискорд", "discord", "zoom"]):
+    if any(k in combined for k in ONLINE_KEYWORDS):
         return FORMAT_ONLINE
     elif any(k in combined for k in ["синхрон", "sync", "асинхрон", "async", "зеркало"]):
         return FORMAT_SYNC
     else:
         return FORMAT_OFFLINE
+
+
+def infer_participation_format(
+    tournament_format: str,
+    venue_name: Optional[str] = None,
+) -> str:
+    """Infer participation format taking into account team venue for hybrid sync/asynchrons."""
+    if tournament_format == FORMAT_ONLINE or is_online_venue(venue_name):
+        return FORMAT_ONLINE
+    return tournament_format
 
 
 def is_aggregate_tournament(type_name: str, title: str) -> bool:
@@ -420,6 +451,12 @@ class ChGKDataIngester:
                     if not mask_str:
                         continue
 
+                    # Resolve participation format considering team-level venue
+                    sr = res.get("synchRequest") or {}
+                    venue_obj = sr.get("venue") or {}
+                    venue_name = venue_obj.get("name") if isinstance(venue_obj, dict) else str(venue_obj)
+                    part_fmt = infer_participation_format(t_fmt, venue_name)
+
                     # Parse question mask
                     q_idx = 0
                     for char in mask_str:
@@ -430,7 +467,7 @@ class ChGKDataIngester:
                             question_id = f"{t_id}_{q_idx}"
                             t_records.append({
                                 "tournament_id": t_id,
-                                "tournament_type": t_fmt,
+                                "tournament_type": part_fmt,
                                 "date": t_date,
                                 "team_id": team_id,
                                 "player_ids": players[:6],
@@ -561,6 +598,12 @@ class ChGKDataIngester:
                         )
                     if not mask_str:
                         continue
+                    # Resolve participation format considering team-level venue
+                    sr = res.get("synchRequest") or {}
+                    venue_obj = sr.get("venue") or {}
+                    venue_name = venue_obj.get("name") if isinstance(venue_obj, dict) else str(venue_obj)
+                    part_fmt = infer_participation_format(t_fmt, venue_name)
+
                     q_idx = 0
                     for char in mask_str:
                         if char in ("X", "x", "?"):
@@ -569,7 +612,7 @@ class ChGKDataIngester:
                             q_idx += 1
                             t_recs.append({
                                 "tournament_id": t_id,
-                                "tournament_type": t_fmt,
+                                "tournament_type": part_fmt,
                                 "date": t_date,
                                 "team_id": team_id,
                                 "player_ids": players[:6],

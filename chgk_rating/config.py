@@ -52,6 +52,7 @@ class ModelConfig:
     batch_size: int = 4096
     epochs: int = 20
     device: str = "cpu"
+    rank_loss_weight: float = 0.1  # Weight for pairwise margin ranking loss in training
 
 
 @dataclass

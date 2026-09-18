@@ -536,3 +536,156 @@ def link_questions(data_path: str, questions_path: str) -> None:
 
 if __name__ == "__main__":
     cli()
+
+
+@cli.command("editor-profile")
+@click.option("--editor-id", required=True, type=int, help="Player ID of the editor")
+def editor_profile_cmd(editor_id: int) -> None:
+    """Inspect difficulty calibration track record and bias for an editor."""
+    from chgk_rating.editor_analytics import get_editor_registry
+
+    reg = get_editor_registry()
+    prof = reg.get_editor_profile(editor_id)
+    if prof is None:
+        click.echo(f"Editor {editor_id} not found in historical tournaments database.", err=True)
+        return
+
+    click.echo(f"================ Editor Calibration Profile: {prof.name} ================")
+    click.echo(f"Editor ID:            {prof.editor_id}")
+    click.echo(f"Tournaments Edited:   {prof.tournaments_count}")
+    click.echo(f"Average Forecast DL:  {prof.avg_forecast_dl:.2f}")
+    click.echo(f"Average TrueDL:       {prof.avg_true_dl:.2f}")
+    click.echo(f"Raw Bias (True-Fc):   {prof.raw_bias:+.2f}")
+    click.echo(f"Calibrated Bias (β):  {prof.calibrated_bias:+.2f}")
+    click.echo(f"Forecast Tendency:    {prof.tendency.upper()}")
+    click.echo(f"Calibration Accuracy: {prof.accuracy_half_dl:.1%} within ±0.5 DL")
+    click.echo(f"Error Metrics:        RMSE = {prof.rmse:.2f}, MAE = {prof.mae:.2f}")
+    click.echo("==========================================================================")
+
+
+@cli.command("editors-leaderboard")
+@click.option("--min-tournaments", default=10, type=int, help="Minimum tournaments edited")
+@click.option(
+    "--sort-by",
+    default="accuracy",
+    type=click.Choice(["accuracy", "rmse", "count", "bias"]),
+    help="Sorting criterion",
+)
+@click.option("--limit", default=20, type=int, help="Number of editors to display")
+def editors_leaderboard_cmd(min_tournaments: int, sort_by: str, limit: int) -> None:
+    """Display leaderboard of top calibrated tournament editors."""
+    from chgk_rating.editor_analytics import get_editor_registry
+
+    reg = get_editor_registry()
+    top = reg.get_top_editors(min_tournaments=min_tournaments, sort_by=sort_by, limit=limit)
+
+    click.echo(f"\nTop {len(top)} Editors (min {min_tournaments} tournaments, sorted by {sort_by}):")
+    click.echo(f"{'#':<4} {'Name':<32} {'Tours':<7} {'Avg Fc':<8} {'Avg True':<9} {'Bias':<7} {'Acc ±0.5':<10} {'RMSE':<6}")
+    click.echo("-" * 86)
+    for i, p in enumerate(top, start=1):
+        click.echo(
+            f"{i:<4} {p.name[:30]:<32} {p.tournaments_count:<7} "
+            f"{p.avg_forecast_dl:<8.2f} {p.avg_true_dl:<9.2f} "
+            f"{p.calibrated_bias:<+7.2f} {p.accuracy_half_dl:<10.1%} {p.rmse:<6.2f}"
+        )
+
+
+@cli.command("simulate-match")
+@click.option("--team-a", required=True, help="Comma-separated player IDs for Team A")
+@click.option("--team-b", required=True, help="Comma-separated player IDs for Team B")
+@click.option("--target-dl", default=5.0, type=float, help="Target tournament difficulty")
+@click.option("--editors", default=None, help="Comma-separated editor player IDs")
+@click.option("--questions", default=36, type=int, help="Number of questions")
+@click.option("--format", "fmt", default=FORMAT_OFFLINE, help="Tournament format")
+def simulate_match_cmd(
+    team_a: str, team_b: str, target_dl: float, editors: Optional[str], questions: int, fmt: str
+) -> None:
+    """Simulate head-to-head match given rosters, target DL and editors."""
+    from chgk_rating.analytics import load_model_and_metadata, predict_team_match
+
+    model, metadata = load_model_and_metadata()
+    p_a = [p.strip() for p in team_a.split(",") if p.strip()]
+    p_b = [p.strip() for p in team_b.split(",") if p.strip()]
+    e_ids = [int(e.strip()) for e in editors.split(",") if e.strip()] if editors else None
+
+    res = predict_team_match(
+        model=model,
+        metadata=metadata,
+        team_a_players=p_a,
+        team_b_players=p_b,
+        format_name=fmt,
+        target_dl=target_dl,
+        editor_ids=e_ids,
+        num_questions=questions,
+    )
+    click.echo("\n================ Match Simulation Result ================")
+    click.echo(f"Target DL:              {res['target_dl']} -> Calibrated TrueDL: {res['calibrated_dl']}")
+    click.echo(f"Team A Solve Prob:      {res['team_a_solve_prob']:.1%} (Exp. Score: {res['team_a_expected_score']} / {questions})")
+    click.echo(f"Team B Solve Prob:      {res['team_b_solve_prob']:.1%} (Exp. Score: {res['team_b_expected_score']} / {questions})")
+    click.echo(f"Team A Win Prob:        {res['prob_team_a_wins']:.1%}")
+    click.echo(f"Team B Win Prob:        {res['prob_team_b_wins']:.1%}")
+    click.echo(f"Tie Prob:               {res['prob_tie']:.1%}")
+    click.echo("=========================================================\n")
+
+
+@cli.command("simulate-tournament")
+@click.option(
+    "--teams-file",
+    required=True,
+    type=click.Path(exists=True),
+    help="JSON file containing dictionary of team names to list of player IDs",
+)
+@click.option("--target-dl", default=5.0, type=float, help="Target tournament difficulty")
+@click.option("--editors", default=None, help="Comma-separated editor player IDs")
+@click.option("--questions", default=36, type=int, help="Number of questions")
+@click.option("--format", "fmt", default=FORMAT_OFFLINE, help="Tournament format (offline, sync, online)")
+@click.option("--simulations", default=3000, type=int, help="Number of Monte Carlo simulation runs")
+def simulate_tournament_cmd(
+    teams_file: str,
+    target_dl: float,
+    editors: Optional[str],
+    questions: int,
+    fmt: str,
+    simulations: int,
+) -> None:
+    """Predict tournament standings, expected score distribution, and win probabilities."""
+    import json
+    from chgk_rating.analytics import load_model_and_metadata, simulate_tournament
+
+    with open(teams_file, "r", encoding="utf-8") as f:
+        teams_data = json.load(f)
+
+    model, metadata = load_model_and_metadata()
+    e_ids = [int(e.strip()) for e in editors.split(",") if e.strip()] if editors else None
+
+    res = simulate_tournament(
+        model=model,
+        metadata=metadata,
+        teams=teams_data,
+        format_name=fmt,
+        target_dl=target_dl,
+        editor_ids=e_ids,
+        num_questions=questions,
+        num_simulations=simulations,
+    )
+
+    click.echo("\n================ Tournament Simulation & Predicted Standings ================")
+    click.echo(f"Format:             {fmt.upper()}")
+    click.echo(f"Questions:          {questions}")
+    click.echo(f"Target DL:          {res['target_dl']} -> Calibrated TrueDL: {res['calibrated_dl']}")
+    if e_ids:
+        click.echo(f"Editors:            {e_ids}")
+    click.echo("-" * 80)
+    click.echo(f"{'#':<4} {'Team Name':<32} {'Exp Score':<12} {'Solve %':<10} {'Avg Rank':<10} {'P(1st)':<9} {'P(Top 3)':<9}")
+    click.echo("-" * 80)
+
+    for i, row in enumerate(res["standings"], start=1):
+        click.echo(
+            f"{i:<4} {row['team_name'][:30]:<32} "
+            f"{row['expected_score']:<12.1f} "
+            f"{row['solve_prob']:<10.1%} "
+            f"{row['mean_rank']:<10.2f} "
+            f"{row['prob_1st_place']:<9.1%} "
+            f"{row['prob_top_3']:<9.1%}"
+        )
+    click.echo("=============================================================================\n")

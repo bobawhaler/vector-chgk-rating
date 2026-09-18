@@ -52,10 +52,12 @@ def test_id_indexer_serialization(tmp_path: Path) -> None:
     assert indexer.get_item(2) == "player_B"
 
     meta_file = tmp_path / "metadata.json"
+    ed_indexer = IDIndexer(start_idx=1)
+    ed_indexer.fit(["ed_1", "ed_2"])
     q_indexer = IDIndexer(start_idx=0)
     q_indexer.fit(["q_1", "q_2"])
 
-    meta = DatasetMetadata(indexer, q_indexer)
+    meta = DatasetMetadata(indexer, editor_indexer=ed_indexer, question_indexer=q_indexer)
     meta.save(meta_file)
 
     loaded_meta = DatasetMetadata.load(meta_file)

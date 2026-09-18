@@ -23,13 +23,20 @@ def setup_mock_model_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     p_indexer = IDIndexer(start_idx=1)
     p_indexer.fit(["27403", "28751", "21026", "74001", "40393", "7008", "99999"])
 
+    ed_indexer = IDIndexer(start_idx=1)
+    ed_indexer.fit(["2421", "3438", "100"])
+
     q_indexer = IDIndexer(start_idx=0)
     q_indexer.fit(["Q_100_1", "Q_100_2", "Q_100_3"])
 
-    metadata = DatasetMetadata(p_indexer, q_indexer)
+    metadata = DatasetMetadata(
+        player_indexer=p_indexer,
+        editor_indexer=ed_indexer,
+        question_indexer=q_indexer,
+    )
     model = DualEmbeddingChGKModel(
         num_players=len(p_indexer) + 1,
-        num_questions=len(q_indexer),
+        num_editors=len(ed_indexer) + 1,
         dim_k=8,
         dim_c=4,
     )
@@ -45,7 +52,7 @@ def setup_mock_model_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
                 "dim_k": 8,
                 "dim_c": 4,
                 "num_players": len(p_indexer) + 1,
-                "num_questions": len(q_indexer),
+                "num_editors": len(ed_indexer) + 1,
                 "num_formats": 3,
             },
         },
@@ -140,3 +147,36 @@ def test_cli_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert res.exit_code == 0
     assert model_path.exists()
     assert meta_path.exists()
+
+
+def test_editor_calibration_api():
+    client = TestClient(app)
+    response = client.get("/editors/leaderboard?min_tournaments=1&limit=5")
+    assert response.status_code == 200
+    data = response.json()
+    assert isinstance(data, list)
+    if len(data) > 0:
+        first_id = data[0]["editor_id"]
+        res_single = client.get(f"/editor/{first_id}/calibration")
+        assert res_single.status_code == 200
+        assert res_single.json()["editor_id"] == first_id
+
+
+def test_simulate_tournament_api():
+    client = TestClient(app)
+    payload = {
+        "teams": {
+            "Team A": [1585, 23737],
+            "Team B": [62, 707],
+        },
+        "format": "offline",
+        "target_dl": 4.5,
+        "editor_ids": [2421],
+        "num_questions": 36,
+    }
+    response = client.post("/simulate_tournament", json=payload)
+    assert response.status_code == 200
+    data = response.json()
+    assert "standings" in data
+    assert len(data["standings"]) == 2
+    assert "prob_1st_place" in data["standings"][0]

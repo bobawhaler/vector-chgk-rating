@@ -13,7 +13,9 @@ from chgk_rating.data_loader import (
     ChGKDataIngester,
     ResponseCache,
     generate_synthetic_dataset,
+    infer_participation_format,
     is_aggregate_tournament,
+    is_online_venue,
     normalize_tournament_format,
 )
 
@@ -27,11 +29,8 @@ def test_response_cache(tmp_path: Path) -> None:
 
     assert cache.get(url) is None
     cache.set(url, 200, data)
+    assert cache.get(url) == data
 
-    cached_data = cache.get(url)
-    assert cached_data == data
-
-    # Test cache invalidation
     cache.invalidate(url)
     assert cache.get(url) is None
 
@@ -47,6 +46,21 @@ def test_tournament_format_normalization() -> None:
     assert normalize_tournament_format("Асинхрон", "Открытый турнир") == FORMAT_SYNC
     assert normalize_tournament_format("Онлайн", "Турнир в Zoom") == FORMAT_ONLINE
     assert normalize_tournament_format("Синхрон", "Онлайн-зеркало в дискорде") == FORMAT_ONLINE
+
+
+def test_venue_level_format_inference() -> None:
+    assert is_online_venue("Онлайн / Гончар Денис") is True
+    assert is_online_venue("Discord / Сервер игры") is True
+    assert is_online_venue("Площадка Zoom") is True
+    assert is_online_venue("Москва / Дудкина Алёна") is False
+    assert is_online_venue("Одесса") is False
+    assert is_online_venue(None) is False
+
+    # Sync package played online vs in club
+    assert infer_participation_format(FORMAT_SYNC, "Онлайн / Гончар Денис") == FORMAT_ONLINE
+    assert infer_participation_format(FORMAT_SYNC, "Одесса") == FORMAT_SYNC
+    assert infer_participation_format(FORMAT_ONLINE, "Одесса") == FORMAT_ONLINE
+    assert infer_participation_format(FORMAT_OFFLINE, None) == FORMAT_OFFLINE
 
 
 def test_aggregate_tournament_filtering() -> None:

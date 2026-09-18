@@ -72,17 +72,21 @@ class DatasetMetadata:
     def __init__(
         self,
         player_indexer: IDIndexer,
-        question_indexer: IDIndexer,
+        editor_indexer: IDIndexer,
+        question_indexer: Optional[IDIndexer] = None,
         format_map: Dict[str, int] = FORMAT_TO_ID,
         player_last_date: Optional[Dict[str, str]] = None,
         pair_last_date: Optional[Dict[str, str]] = None,
+        pair_games_count: Optional[Dict[str, int]] = None,
         player_activity_history: Optional[Dict[str, List[Dict[str, Any]]]] = None,
     ) -> None:
         self.player_indexer = player_indexer
-        self.question_indexer = question_indexer
+        self.editor_indexer = editor_indexer
+        self.question_indexer = question_indexer or IDIndexer(start_idx=0)
         self.format_map = format_map
         self.player_last_date: Dict[str, str] = player_last_date or {}
         self.pair_last_date: Dict[str, str] = pair_last_date or {}
+        self.pair_games_count: Dict[str, int] = pair_games_count or {}
         self.player_activity_history: Dict[str, List[Dict[str, Any]]] = (
             player_activity_history or {}
         )
@@ -93,10 +97,12 @@ class DatasetMetadata:
             json.dump(
                 {
                     "player_indexer": self.player_indexer.to_dict(),
+                    "editor_indexer": self.editor_indexer.to_dict(),
                     "question_indexer": self.question_indexer.to_dict(),
                     "format_map": self.format_map,
                     "player_last_date": self.player_last_date,
                     "pair_last_date": self.pair_last_date,
+                    "pair_games_count": self.pair_games_count,
                     "player_activity_history": self.player_activity_history,
                 },
                 f,
@@ -107,48 +113,65 @@ class DatasetMetadata:
     def load(cls, path: Path = DEFAULT_META_PATH) -> DatasetMetadata:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
+        ed_data = data.get("editor_indexer")
+        if ed_data:
+            ed_indexer = IDIndexer.from_dict(ed_data)
+        else:
+            ed_indexer = IDIndexer(start_idx=1)
+        q_data = data.get("question_indexer")
+        q_indexer = IDIndexer.from_dict(q_data) if q_data else IDIndexer(start_idx=0)
         return cls(
             player_indexer=IDIndexer.from_dict(data["player_indexer"]),
-            question_indexer=IDIndexer.from_dict(data["question_indexer"]),
+            editor_indexer=ed_indexer,
+            question_indexer=q_indexer,
             format_map=data.get("format_map", FORMAT_TO_ID),
             player_last_date=data.get("player_last_date", {}),
             pair_last_date=data.get("pair_last_date", {}),
+            pair_games_count=data.get("pair_games_count", {}),
             player_activity_history=data.get("player_activity_history", {}),
         )
 
 
 class ChGKDataset(Dataset):
-    """PyTorch Dataset for atomic team-question observations with temporal tracking."""
+    """PyTorch Dataset for atomic team observations conditioned on tournament editors and format."""
 
     def __init__(
         self,
         df: pd.DataFrame,
         metadata: DatasetMetadata,
         max_players_per_team: int = 6,
+        max_editors_per_tourn: int = 6,
+        tournament_editors_map: Optional[Dict[int, List[int]]] = None,
         track_running_state: bool = True,
     ) -> None:
         self.max_players = max_players_per_team
+        self.max_editors = max_editors_per_tourn
         self.metadata = metadata
 
         p_idxer = metadata.player_indexer
+        ed_idxer = metadata.editor_indexer
         q_idxer = metadata.question_indexer
         fmt_map = metadata.format_map
 
+        # If tournament_editors_map not provided, lazily load from editor_registry
+        if tournament_editors_map is None:
+            from chgk_rating.editor_analytics import get_editor_registry
+            reg = get_editor_registry()
+            reg.load_data()
+            tournament_editors_map = {
+                tid: meta["editor_ids"]
+                for tid, meta in reg._tournament_metadata.items()
+            }
+
         # Sort chronologically to compute realistic running gaps
         sorted_df = df.sort_values(by=["date", "tournament_id"]).reset_index(drop=True)
-
-        rosters: List[List[int]] = []
-        question_ids: List[int] = []
-        format_ids: List[int] = []
-        labels: List[float] = []
-        player_delta_ts: List[List[float]] = []
-        pairwise_delta_ts: List[List[List[float]]] = []
 
         # Running timestamps for computing Delta_t
         running_player_last: Dict[str, datetime] = {}
         running_pair_last: Dict[str, datetime] = {}
 
-        q_ids = sorted_df["question_id"].astype(str).tolist()
+        t_ids = sorted_df["tournament_id"].tolist() if "tournament_id" in sorted_df.columns else [0] * len(sorted_df)
+        q_ids = sorted_df["question_id"].astype(str).tolist() if "question_id" in sorted_df.columns else ["0"] * len(sorted_df)
         fmt_strs = (
             sorted_df["tournament_type"]
             .fillna(FORMAT_OFFLINE)
@@ -166,7 +189,9 @@ class ChGKDataset(Dataset):
         )
         player_id_lists = sorted_df["player_ids"].tolist()
         total_rows = len(sorted_df)
+
         rosters_arr = np.zeros((total_rows, max_players_per_team), dtype=np.int64)
+        editors_arr = np.zeros((total_rows, max_editors_per_tourn), dtype=np.int64)
         question_ids_arr = np.zeros(total_rows, dtype=np.int64)
         format_ids_arr = np.zeros(total_rows, dtype=np.int64)
         labels_arr = np.zeros((total_rows, 1), dtype=np.float32)
@@ -174,21 +199,44 @@ class ChGKDataset(Dataset):
         pairwise_deltas_arr = np.zeros(
             (total_rows, max_players_per_team, max_players_per_team), dtype=np.float32
         )
+        pairwise_exp_arr = np.zeros(
+            (total_rows, max_players_per_team, max_players_per_team), dtype=np.float32
+        )
+
+        # Running counts of joint games for pairs
+        running_pair_counts: Dict[str, int] = dict(metadata.pair_games_count) if metadata.pair_games_count else {}
+        seen_tournament_pairs: set[Tuple[int, str]] = set()
 
         count = 0
         last_team_key = None
         cached_mapped_p: Optional[List[int]] = None
         cached_p_deltas: Optional[List[float]] = None
         cached_pair_mat: Optional[List[List[float]]] = None
+        cached_exp_mat: Optional[List[List[float]]] = None
 
-        for q_id_raw, fmt_str, solved_val, curr_date_str, raw_players in zip(
-            q_ids, fmt_strs, solved_vals, date_strs, player_id_lists
+        cached_tid = None
+        cached_mapped_eds: Optional[List[int]] = None
+
+        for t_id_val, q_id_raw, fmt_str, solved_val, curr_date_str, raw_players in zip(
+            t_ids, q_ids, fmt_strs, solved_vals, date_strs, player_id_lists
         ):
-            if q_id_raw not in q_idxer.item_to_idx:
-                continue
-
-            q_idx = q_idxer.get_idx(q_id_raw)
+            q_idx = q_idxer.get_idx(q_id_raw, default=0)
             fmt_id = fmt_map.get(fmt_str, 0)
+
+            # Map tournament editors
+            if t_id_val == cached_tid and cached_mapped_eds is not None:
+                mapped_eds = cached_mapped_eds
+            else:
+                raw_eds = tournament_editors_map.get(int(t_id_val), [])
+                mapped_eds = []
+                for e in raw_eds[:max_editors_per_tourn]:
+                    e_idx = ed_idxer.get_idx(str(e), default=0)
+                    if e_idx > 0:
+                        mapped_eds.append(e_idx)
+                while len(mapped_eds) < max_editors_per_tourn:
+                    mapped_eds.append(0)
+                cached_tid = t_id_val
+                cached_mapped_eds = mapped_eds
 
             # Check if team roster and date are identical to previous question
             raw_tuple = tuple(raw_players) if isinstance(raw_players, (list, np.ndarray)) else (raw_players,)
@@ -198,6 +246,7 @@ class ChGKDataset(Dataset):
                 mapped_p = cached_mapped_p
                 p_deltas = cached_p_deltas
                 pair_mat = cached_pair_mat
+                exp_mat = cached_exp_mat
             else:
                 curr_date = parse_date(curr_date_str)
                 raw_p_list = list(raw_tuple)
@@ -224,8 +273,9 @@ class ChGKDataset(Dataset):
                         if track_running_state:
                             running_player_last[p_str] = curr_date
 
-                # Compute pairwise joint gaps
+                # Compute pairwise joint gaps and experience log(1 + N_games)
                 pair_mat = [[0.0] * max_players_per_team for _ in range(max_players_per_team)]
+                exp_mat = [[0.0] * max_players_per_team for _ in range(max_players_per_team)]
                 n_val = len(valid_raw_p)
                 for i in range(n_val):
                     for m in range(n_val):
@@ -241,8 +291,17 @@ class ChGKDataset(Dataset):
                             else:
                                 p_days = 0.0
                             pair_mat[i][m] = p_days
+
+                            # Experience from historical joint games
+                            past_games = running_pair_counts.get(pair_key, 0)
+                            exp_mat[i][m] = float(np.log1p(past_games))
+
                             if track_running_state and i < m:
                                 running_pair_last[pair_key] = curr_date
+                                tourn_pair = (int(t_id_val), pair_key)
+                                if tourn_pair not in seen_tournament_pairs:
+                                    seen_tournament_pairs.add(tourn_pair)
+                                    running_pair_counts[pair_key] = past_games + 1
 
                 # Pad to max_players
                 while len(mapped_p) < max_players_per_team:
@@ -253,28 +312,34 @@ class ChGKDataset(Dataset):
                 cached_mapped_p = mapped_p
                 cached_p_deltas = p_deltas
                 cached_pair_mat = pair_mat
+                cached_exp_mat = exp_mat
 
             rosters_arr[count] = mapped_p
+            editors_arr[count] = mapped_eds
             question_ids_arr[count] = q_idx
             format_ids_arr[count] = fmt_id
             labels_arr[count, 0] = solved_val
             player_deltas_arr[count] = p_deltas
             pairwise_deltas_arr[count] = pair_mat
+            pairwise_exp_arr[count] = exp_mat
             count += 1
 
-        # Update metadata's global last seen timestamps if tracking
+        # Update metadata's global last seen timestamps and pair games count if tracking
         if track_running_state:
             for p_str, dt_val in running_player_last.items():
                 metadata.player_last_date[p_str] = dt_val.strftime("%Y-%m-%d")
             for pair_key, dt_val in running_pair_last.items():
                 metadata.pair_last_date[pair_key] = dt_val.strftime("%Y-%m-%d")
+            metadata.pair_games_count.update(running_pair_counts)
 
         self.rosters = torch.from_numpy(rosters_arr[:count])
+        self.editor_ids = torch.from_numpy(editors_arr[:count])
         self.question_ids = torch.from_numpy(question_ids_arr[:count])
         self.format_ids = torch.from_numpy(format_ids_arr[:count])
         self.labels = torch.from_numpy(labels_arr[:count])
         self.player_delta_ts = torch.from_numpy(player_deltas_arr[:count])
         self.pairwise_delta_ts = torch.from_numpy(pairwise_deltas_arr[:count])
+        self.pairwise_exp = torch.from_numpy(pairwise_exp_arr[:count])
 
     def __len__(self) -> int:
         return len(self.labels)
@@ -282,9 +347,11 @@ class ChGKDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         return {
             "player_ids": self.rosters[idx],
+            "editor_ids": self.editor_ids[idx],
             "question_id": self.question_ids[idx],
             "format_id": self.format_ids[idx],
             "label": self.labels[idx],
             "player_delta_t": self.player_delta_ts[idx],
             "pairwise_delta_t": self.pairwise_delta_ts[idx],
+            "pairwise_exp": self.pairwise_exp[idx],
         }

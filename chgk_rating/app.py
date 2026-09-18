@@ -231,19 +231,27 @@ def predict_match(req: PredictMatchRequest) -> PredictMatchResponse:
     with torch.no_grad():
         for q in req.question_ids:
             q_raw = str(q)
-            q_idx = q_indexer.get_idx(q_raw, default=None)
-            if q_idx is None:
-                # If question is unknown, use average question index 0
-                q_idx = 0
-
-            q_tensor = torch.tensor([q_idx], dtype=torch.long)
-            out = model(
-                p_tensor,
-                q_tensor,
-                f_tensor,
-                player_delta_t=player_delta_t,
-                pairwise_delta_t=pairwise_delta_t,
-            )
+            if hasattr(model, "editor_emb"):
+                # Current architecture: model is parameterized by editors, not question embeddings
+                # We do forward pass with default editor (idx 0)
+                ed_tensor = torch.zeros((1, 1), dtype=torch.long)
+                out = model(
+                    player_ids=p_tensor,
+                    editor_ids=ed_tensor,
+                    format_ids=f_tensor,
+                    player_delta_t=player_delta_t,
+                    pairwise_delta_t=pairwise_delta_t,
+                )
+            else:
+                q_idx = q_indexer.get_idx(q_raw, default=0) if q_indexer else 0
+                q_tensor = torch.tensor([q_idx], dtype=torch.long)
+                out = model(
+                    player_ids=p_tensor,
+                    question_ids=q_tensor,
+                    format_ids=f_tensor,
+                    player_delta_t=player_delta_t,
+                    pairwise_delta_t=pairwise_delta_t,
+                )
 
             p_final = float(out["probs"][0, 0].item())
             p_gen = float(out["p_gen"][0, 0].item())
@@ -378,3 +386,98 @@ def get_player_timeline(
         player_id=str(player_id),
         timeline=[TimelinePoint(**pt) for pt in raw_timeline],
     )
+
+
+# --- Editor Calibration & Tournament Simulation Endpoints ---
+
+class EditorCalibrationResponse(BaseModel):
+    editor_id: int
+    name: str
+    tournaments_count: int
+    avg_forecast_dl: float
+    avg_true_dl: float
+    raw_bias: float
+    calibrated_bias: float
+    rmse: float
+    mae: float
+    accuracy_half_dl: float
+    tendency: str
+
+
+class SimulateTournamentRequest(BaseModel):
+    teams: Dict[str, List[Union[int, str]]] = Field(
+        ..., min_length=2, description="Dictionary mapping team names to player IDs"
+    )
+    format: str = Field(
+        default=FORMAT_OFFLINE, description="Tournament format: offline, sync, or online"
+    )
+    target_dl: Optional[float] = Field(
+        default=5.0, description="Target difficulty declared by tournament/editors"
+    )
+    editor_ids: Optional[List[int]] = Field(
+        default=None, description="List of editor player IDs"
+    )
+    num_questions: int = Field(
+        default=36, ge=1, le=120, description="Number of questions in tournament"
+    )
+
+
+class TeamStanding(BaseModel):
+    team_name: str
+    solve_prob: float
+    expected_score: float
+    mean_rank: float
+    prob_1st_place: float
+    prob_top_3: float
+
+
+class SimulateTournamentResponse(BaseModel):
+    calibrated_dl: float
+    target_dl: Optional[float]
+    editor_ids: List[int]
+    num_questions: int
+    standings: List[TeamStanding]
+
+
+@app.get("/editor/{editor_id}/calibration", response_model=EditorCalibrationResponse)
+def get_editor_calibration_route(editor_id: int) -> EditorCalibrationResponse:
+    from chgk_rating.editor_analytics import get_editor_registry
+    from dataclasses import asdict
+
+    reg = get_editor_registry()
+    prof = reg.get_editor_profile(editor_id)
+    if prof is None:
+        raise HTTPException(status_code=404, detail=f"Editor {editor_id} not found in calibration database.")
+
+    return EditorCalibrationResponse(**asdict(prof))
+
+
+@app.get("/editors/leaderboard", response_model=List[EditorCalibrationResponse])
+def get_editors_leaderboard_route(
+    min_tournaments: int = Query(5, ge=1, description="Minimum tournaments edited"),
+    sort_by: str = Query("accuracy", description="Sort by: accuracy, rmse, count, or bias"),
+    limit: int = Query(50, ge=1, le=200, description="Max results"),
+) -> List[EditorCalibrationResponse]:
+    from chgk_rating.editor_analytics import get_editor_registry
+    from dataclasses import asdict
+
+    reg = get_editor_registry()
+    top = reg.get_top_editors(min_tournaments=min_tournaments, sort_by=sort_by, limit=limit)
+    return [EditorCalibrationResponse(**asdict(p)) for p in top]
+
+
+@app.post("/simulate_tournament", response_model=SimulateTournamentResponse)
+def simulate_tournament_route(req: SimulateTournamentRequest) -> SimulateTournamentResponse:
+    from chgk_rating.analytics import simulate_tournament
+
+    model, metadata = get_model_and_meta()
+    result = simulate_tournament(
+        model=model,
+        metadata=metadata,
+        teams=req.teams,
+        format_name=req.format,
+        target_dl=req.target_dl,
+        editor_ids=req.editor_ids,
+        num_questions=req.num_questions,
+    )
+    return SimulateTournamentResponse(**result)
