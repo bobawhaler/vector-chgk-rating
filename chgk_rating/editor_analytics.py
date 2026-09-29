@@ -17,6 +17,18 @@ logger = logging.getLogger(__name__)
 DEFAULT_CACHE_DB = Path("data/chgk_cache.db")
 
 
+DEFAULT_ASYNC_DL_OFFSET = 0.64
+
+
+def normalize_tournament_name(name: str) -> str:
+    """Strip bracketed qualifiers like (асинхрон), (онлайн), (синхрон) and punctuation."""
+    import re
+
+    s = re.sub(r"\s*\([^)]*\)", "", name)
+    s = re.sub(r"[\.\,\-\–\—\:\«\»\"\'\?]", " ", s)
+    return " ".join(s.lower().split())
+
+
 @dataclass
 class EditorProfile:
     """Statistical profile of a tournament editor's difficulty calibration."""
@@ -27,7 +39,7 @@ class EditorProfile:
     avg_forecast_dl: float
     avg_true_dl: float
     std_true_dl: float  # Historical standard deviation of package difficulty
-    raw_bias: float  # avg(TrueDL - ForecastDL)
+    raw_bias: float  # avg(IntrinsicTrueDL - ForecastDL)
     calibrated_bias: float  # Bayesian smoothed bias beta_e
     rmse: float
     mae: float
@@ -43,16 +55,18 @@ class EditorCalibrationRegistry:
         db_path: Path = DEFAULT_CACHE_DB,
         prior_n0: float = 3.0,
         prior_mu0: float = -0.02,
+        async_dl_offset: float = DEFAULT_ASYNC_DL_OFFSET,
     ) -> None:
         self.db_path = Path(db_path)
         self.prior_n0 = prior_n0
         self.prior_mu0 = prior_mu0
+        self.async_dl_offset = async_dl_offset
         self._profiles: Dict[int, EditorProfile] = {}
         self._tournament_metadata: Dict[int, Dict[str, Any]] = {}
         self._is_loaded = False
 
     def load_data(self) -> None:
-        """Load tournament metadata and calculate editor profiles."""
+        """Load tournament metadata and calculate editor profiles using format-invariant intrinsic difficulty."""
         if not self.db_path.exists():
             logger.warning("Cache DB %s not found. Editor profiles empty.", self.db_path)
             self._is_loaded = True
@@ -61,11 +75,8 @@ class EditorCalibrationRegistry:
         con = sqlite3.connect(self.db_path)
         cur = con.cursor()
 
-        # Gather per-tournament records
-        editor_deltas: Dict[int, List[float]] = {}
-        editor_forecasts: Dict[int, List[float]] = {}
-        editor_trues: Dict[int, List[float]] = {}
-        editor_names: Dict[int, str] = {}
+        raw_tournaments: List[Dict[str, Any]] = []
+        name_groups: Dict[str, List[Dict[str, Any]]] = {}
 
         for row in cur.execute("SELECT raw_data FROM ingested_tournaments"):
             try:
@@ -80,19 +91,90 @@ class EditorCalibrationRegistry:
 
             fc = float(fc_raw) if fc_raw is not None and str(fc_raw).strip() != "" else None
             tdl = float(true_raw) if true_raw is not None and str(true_raw).strip() != "" else None
+            t_name = str(t_data.get("name") or "")
+            norm_name = normalize_tournament_name(t_name)
+            t_type = t_data.get("type")
+            t_type_name = t_type.get("name") if isinstance(t_type, dict) else str(t_type or "")
+            d_start = str(t_data.get("dateStart") or "")[:10]
+            ed_ids = [int(e["id"]) for e in editors if isinstance(e, dict) and "id" in e]
 
-            self._tournament_metadata[int(t_id)] = {
-                "id": t_id,
-                "name": t_data.get("name", ""),
-                "date_start": t_data.get("dateStart"),
+            entry = {
+                "id": int(t_id),
+                "name": t_name,
+                "norm_name": norm_name,
+                "type": t_type_name,
+                "date_start": d_start,
                 "forecast_dl": fc,
                 "true_dl": tdl,
-                "editor_ids": [int(e["id"]) for e in editors if isinstance(e, dict) and "id" in e],
+                "editor_ids": ed_ids,
+                "editors_tuple": tuple(sorted(ed_ids)),
+                "raw_editors": editors,
+            }
+            raw_tournaments.append(entry)
+            if norm_name:
+                name_groups.setdefault(norm_name, []).append(entry)
+
+        con.close()
+
+        # Step 1: Assign unconditional intrinsic difficulty DL_intrinsic for every tournament
+        editor_deltas: Dict[int, List[float]] = {}
+        editor_forecasts: Dict[int, List[float]] = {}
+        editor_trues: Dict[int, List[float]] = {}
+        editor_names: Dict[int, str] = {}
+
+        for t in raw_tournaments:
+            tdl = t["true_dl"]
+            fc = t["forecast_dl"]
+            t_type_l = t["type"].lower()
+            t_name_l = t["name"].lower()
+            is_async = "асинхрон" in t_type_l or "асинхрон" in t_name_l or "онлайн" in t_type_l
+
+            if tdl is None:
+                intrinsic_dl = fc
+            elif not is_async:
+                intrinsic_dl = tdl
+            else:
+                # Find synchronous twin package with same normalized title
+                candidates = [
+                    cand
+                    for cand in name_groups.get(t["norm_name"], [])
+                    if cand["id"] != t["id"]
+                    and not (
+                        "асинхрон" in cand["type"].lower()
+                        or "асинхрон" in cand["name"].lower()
+                        or "онлайн" in cand["type"].lower()
+                    )
+                    and cand["true_dl"] is not None
+                ]
+                if candidates:
+                    # Prefer twin with same editors
+                    best_twin = min(
+                        candidates,
+                        key=lambda c: (
+                            0 if c["editors_tuple"] == t["editors_tuple"] and len(t["editors_tuple"]) > 0 else 1,
+                            abs((c["forecast_dl"] or 4.0) - (fc or 4.0)) if fc is not None else 0,
+                        ),
+                    )
+                    intrinsic_dl = best_twin["true_dl"]
+                else:
+                    intrinsic_dl = tdl + self.async_dl_offset
+
+            t["intrinsic_true_dl"] = intrinsic_dl
+
+            self._tournament_metadata[t["id"]] = {
+                "id": t["id"],
+                "name": t["name"],
+                "tournament_type": t["type"],
+                "date_start": t["date_start"],
+                "forecast_dl": fc,
+                "true_dl": tdl,
+                "intrinsic_true_dl": intrinsic_dl,
+                "editor_ids": t["editor_ids"],
             }
 
-            if fc is not None and tdl is not None:
-                delta = tdl - fc
-                for ed in editors:
+            if fc is not None and intrinsic_dl is not None:
+                delta = intrinsic_dl - fc
+                for ed in t["raw_editors"]:
                     if not isinstance(ed, dict) or "id" not in ed:
                         continue
                     eid = int(ed["id"])
@@ -106,11 +188,9 @@ class EditorCalibrationRegistry:
 
                     editor_deltas.setdefault(eid, []).append(delta)
                     editor_forecasts.setdefault(eid, []).append(fc)
-                    editor_trues.setdefault(eid, []).append(tdl)
+                    editor_trues.setdefault(eid, []).append(intrinsic_dl)
 
-        con.close()
-
-        # Compute empirical bayes profiles
+        # Step 2: Compute empirical Bayes editor calibration profiles
         profiles: Dict[int, EditorProfile] = {}
         for eid, deltas in editor_deltas.items():
             arr_deltas = np.array(deltas, dtype=np.float64)
@@ -151,7 +231,11 @@ class EditorCalibrationRegistry:
 
         self._profiles = profiles
         self._is_loaded = True
-        logger.info("Loaded calibrations for %d editors across %d tournaments.", len(profiles), len(self._tournament_metadata))
+        logger.info(
+            "Loaded calibrations for %d editors across %d tournaments (intrinsic TrueDL).",
+            len(profiles),
+            len(self._tournament_metadata),
+        )
 
     def ensure_loaded(self) -> None:
         """Lazily load data if not yet loaded."""
@@ -173,11 +257,14 @@ class EditorCalibrationRegistry:
         forecast_dl: Optional[float],
         editor_ids: Optional[List[int]] = None,
         default_dl: float = 4.26,
+        tournament_format: Optional[str] = None,
     ) -> float:
         """Estimate expected TrueDL given target forecast_dl and editor set.
 
         If forecast_dl is None, estimates tournament difficulty directly from the
         historical TrueDL of the editors (Bayesian smoothed towards the global mean).
+        If tournament_format is offline/festival and forecast_dl >= 5.0, applies
+        festival depth calibration.
         """
         self.ensure_loaded()
 
@@ -185,17 +272,23 @@ class EditorCalibrationRegistry:
             # Editor calibration relative to declared target DL
             base_dl = float(forecast_dl)
             if not editor_ids:
-                return float(base_dl + self.prior_mu0)
+                mean_bias = self.prior_mu0
+            else:
+                biases = []
+                for eid in editor_ids:
+                    prof = self._profiles.get(eid)
+                    if prof is not None:
+                        biases.append(prof.calibrated_bias)
+                    else:
+                        biases.append(self.prior_mu0)
 
-            biases = []
-            for eid in editor_ids:
-                prof = self._profiles.get(eid)
-                if prof is not None:
-                    biases.append(prof.calibrated_bias)
-                else:
-                    biases.append(self.prior_mu0)
+                mean_bias = float(np.mean(biases)) if biases else self.prior_mu0
 
-            mean_bias = float(np.mean(biases)) if biases else self.prior_mu0
+            # Offline festival tournaments with declared difficult packages (>= 5.0)
+            # exhibit systematic extra depth (festival bump)
+            if tournament_format in ("offline", "festival") and base_dl >= 5.0:
+                mean_bias = max(mean_bias, 0.20)
+
             return float(base_dl + mean_bias)
         else:
             # When editors DO NOT specify target difficulty:
@@ -221,6 +314,7 @@ class EditorCalibrationRegistry:
         editor_ids: Optional[List[int]] = None,
         default_dl: float = 4.26,
         default_std: float = 0.65,
+        tournament_format: Optional[str] = None,
     ) -> Tuple[float, float]:
         """Estimate (mean, std) of TrueDL distribution for a tournament package.
 
@@ -228,7 +322,9 @@ class EditorCalibrationRegistry:
             Tuple of (expected_mean_dl, expected_std_dl).
         """
         self.ensure_loaded()
-        mean_dl = self.predict_tournament_truedl(forecast_dl, editor_ids, default_dl=default_dl)
+        mean_dl = self.predict_tournament_truedl(
+            forecast_dl, editor_ids, default_dl=default_dl, tournament_format=tournament_format
+        )
 
         if not editor_ids:
             return mean_dl, default_std

@@ -1,12 +1,12 @@
 # ChGK Dual Latent Embedding Rating System
 
-Production-ready neural rating and match prediction system for **What? Where? When? (Что? Где? Когда? / ChGK)**. Built on PyTorch and backed by modern Item Response Theory (IRT), collaborative filtering, and dynamic skill tracking principles.
+Production-ready neural rating and tournament outcome prediction system for **What? Where? When? (Что? Где? Когда? / ChGK)**. Built on PyTorch and grounded in Multidimensional Item Response Theory (MIRT), collaborative filtering, and dynamic skill tracking principles.
 
 ---
 
-## 1. Mathematical Architecture & Scientific Foundations
+## 1. Mathematical Architecture & Core Formulation
 
-The rating system models ChGK as a multi-player collaborative game with asymmetric knowledge profiles, non-linear team aggregation, pairwise team communication dynamics, and editor/package difficulty calibration.
+The rating system models ChGK as a collaborative team game with asymmetric knowledge profiles, non-linear team aggregation, pairwise team communication dynamics, and format-invariant question package difficulty.
 
 ```
        Players (1..6)
@@ -19,167 +19,172 @@ The rating system models ChGK as a multi-player collaborative game with asymmetr
                │
                ▼
   ┌─────────────────────────┐
-  │ Interaction with Editor │ ────► z_know = ⟨K_team, q_editor⟩ - b_editor
+  │ Package & Editor Model  │ ────► z_know = ⟨K_team, e_pkg⟩ - b_pkg(DL_intrinsic)
   └─────────────────────────┘
                │
                ▼
   ┌─────────────────────────┐
-  │   Experience-Weighted   │ ────► S_team = ∑_{i<m} (c_i^T W c_m) · (1 + β_exp log(1 + N_im)) · exp(-γ Δt_im)
+  │   Experience-Weighted   │ ────► S_team = 1/|Pairs| ∑_{i<m} (c_i^T W c_m) · (1 + β_exp tanh(log(1 + N_im))) · exp(-γ Δt_im)
   │     Synergy Matrix      │
   └─────────────────────────┘
                │
                ▼
-   P(Solved) = σ(z_know + S_team + b_format + z_anomaly)
+   P(Solved) = σ(z_know + w_syn · S_team + b_format + z_anomaly)
 ```
 
 ### 1.1. Multidimensional IRT and Knowledge Space
-Standard 1D Rasch/Elo models treat a team as a single scalar $\theta$. This system extends Multidimensional Item Response Theory (MIRT) and matrix factorization to model both individual players and tournaments in latent topic space:
-- **Player Knowledge Vector**: $k_i \in \mathbb{R}^D$ ($D = 16$).
-- **Online Adaptation Component**: $k_{i,\text{online}} = k_{i,\text{base}} + \Delta k_{i,\text{online}}$, where $\Delta k_{i,\text{online}}$ is subject to $10\times$ Bayesian shrinkage penalty ($L_2$ regularization pulling toward zero unless strong statistical evidence separates online performance from live offline performance).
-- **Editor / Question Vector**: $q_j \in \mathbb{R}^D$ ($D = 16$), capturing the topic requirements, and difficulty scalar bias $b_j \in \mathbb{R}$.
+Standard 1D Rasch or Elo models treat an entire team as a single scalar skill $\theta$. This system extends Multidimensional Item Response Theory (MIRT) to model individual players and tournament packages in latent factor space:
+- **Player Base Knowledge Vector**: $k_i \in \mathbb{R}^D$ ($D = 6$: 1 general cognitive/analytical ability dimension + 5 macro-topic dimensions). Dimensionality reduction via SVD demonstrates that $D=6$ captures $82\%$ of variance while completely eliminating noise and overfitting on high-frequency synchronous players.
+- **Online Divergence Component**: In remote online play (Discord/Zoom/asynchronous platforms), player performance can deviate due to search tools or unproctored taking:
+  $$k_{i, \text{online}} = k_{i, \text{base}} + \Delta k_{i, \text{online}}$$
+  where $\Delta k_{i, \text{online}}$ is subject to a $10\times$ $L_2$ Bayesian shrinkage penalty pulling toward zero. Only players with statistically significant and persistent divergence across multiple tournaments develop non-zero online delta vectors.
+- **Editor / Package Vector**: $e_{\text{pkg}} \in \mathbb{R}^D$ ($D = 6$), pooling topic requirements and stylistic characteristics of the package editors.
 
-### 1.2. Knowledge Pooling: Smooth-Max ($L_{\infty}$ Approximation)
-A team answers a question if **at least one** player possesses the required insight or factual knowledge. Pure linear averaging ($\frac{1}{n} \sum k_i$) penalizes teams for carrying weaker support players or specialists, whereas strict hard-max ($\max_i k_i$) has non-smooth gradients and discards overlapping depth across multiple knowledgeable players.
+### 1.2. Unconditional Format-Invariant Package Difficulty ($DL_{\text{intrinsic}}$)
+The tournament website's raw `trueDL` metric is circular and format-polluted: because unproctored online taking enables higher solve rates, an identical package played synchronously vs. asynchronously receives a $\sim 0.64$ lower `trueDL` on the website.
 
-We employ a learned temperature-controlled **Smooth-Max (LogSumExp)** pooling over the team:
+The system decouples intrinsic question difficulty from play environment:
+- **Synchronous / Offline Tournaments**: $DL_{\text{intrinsic}} = TrueDL_{\text{site}}$.
+- **Asynchronous Mirror Packages**: Paired with their synchronous twins so that $DL_{\text{intrinsic}} = TrueDL_{\text{sync\_twin}}$.
+- **Unpaired Online Asynchronous Packages**: $DL_{\text{intrinsic}} = TrueDL_{\text{site}} + 0.64$.
+- **Stage 1 Bayesian Editor Calibration**:
+  $$\beta_e = \frac{\sum (DL_{\text{intrinsic}} - DL_{\text{forecast}}) + n_0 \mu_0}{n + n_0}$$
+  Predicting unconditional intrinsic tournament difficulty before the tournament is played:
+  $$DL_{\text{calibrated}} = DL_{\text{forecast}} + \frac{1}{E} \sum_{e \in \text{Editors}} \beta_e$$
+- **Intrinsic Difficulty Sensitivity in Model**:
+  $$b_{\text{pkg}} = \bar{b}_{\text{editors}} + \alpha_{\text{dl}} \cdot (DL_{\text{intrinsic}} - DL_{\text{baseline}})$$
+
+The higher solve rates of online tournaments are thus attributed strictly to the format baseline shift $b_{\text{format}}$, individual search factors $\Delta k_{i, \text{online}}$, and format-specific team communication $c_i(F)$, rather than artificially pretending the questions became easier.
+
+### 1.3. Knowledge Pooling: Smooth-Max ($L_{\infty}$ Approximation)
+A team solves a question if **at least one** player possesses the required insight or factual knowledge. Pure linear averaging ($\frac{1}{n} \sum k_i$) penalizes teams for carrying specialists or support players, while hard maximum ($\max_i k_i$) suffers from zero gradients for non-maximum players and ignores team depth:
 $$K_{\text{team}, d} = k_{\max, d} + \tau \cdot \log \sum_{i=1}^{n} \exp\left(\frac{k_{i, d} - k_{\max, d}}{\tau}\right)$$
-- $\tau > 0$ is a learnable parameter initialized at $\approx 0.5$ and converged to $\tau \approx 0.315$.
-- As $\tau \to 0$, $K_{\text{team}} \to \max_i k_i$ (pure union of knowledge without penalty for incomplete rosters).
-- Incomplete teams (e.g. 1–5 players) are handled natively without artificial penalties.
+- $\tau = \text{softplus}(\text{raw\_temp}) + 0.05$: learnable temperature parameter.
+- As $\tau \to 0$, Smooth-Max approaches exact hard maximum without penalizing incomplete rosters (1–5 players).
 
-### 1.3. Pairwise Communication & Experience-Weighted Synergy
+### 1.4. Bounded Synergy & Experience Saturation
 Beyond individual knowledge, teams exhibit chemistry and discussion flow modeled via bilinear forms:
-$$S_{im}(t) = \left(c_i(F)^\top W_{\text{synergy}} c_m(F)\right) \cdot \left(1 + \beta_{\text{exp}} \log(1 + N_{im})\right) \cdot \exp(-\gamma_{\text{syn}} \Delta t_{im})$$
-- $c_i(F) = c_{\text{base}, i} + e_F \odot c_{\delta, i}$: player communication representation modulated by format $F \in \{\text{offline}, \text{sync}, \text{online}\}$.
-- $N_{im}$: historical count of tournaments played jointly by pair $(i, m)$ prior to the game.
-- $\beta_{\text{exp}} > 0$: learned experience scaling weight ($\approx 0.070$).
-- $\gamma_{\text{syn}}$: learned synergy decay half-life ($\approx 470$ days).
-- $S_{\text{team}} = \sum_{i < m} S_{im}$.
+$$S_{im}(t) = \left(c_i(F)^\top W_{\text{synergy}} c_m(F)\right) \cdot \left(1 + \beta_{\text{exp}} \tanh(\log(1 + N_{im}))\right) \cdot \exp(-\gamma_{\text{syn}} \Delta t_{im})$$
+- **Communication Vectors**: $c_i(F) = c_{\text{base}, i} + e_F \odot c_{\delta, i} \in \mathbb{R}^M$ ($M = 3$ core team roles: captain/selector, generator, critic).
+- **Intensive Pairwise Average**: Total team synergy is scaled by available pairs:
+  $$S_{\text{team}} = \frac{1}{\max(1, \binom{n}{2})} \sum_{i < m} S_{im}$$
+- **Bounded Synergy Weight**: $w_{\text{syn}} = 0.25 \cdot \sigma(\text{raw\_synergy\_weight}) \in [0, 0.25]$. Constrains chemistry to realistic human bounds ($\approx \pm 2.5$ questions on a 120-question package) so team chemistry can never overpower individual knowledge.
+- **Experience Saturation**: $\tanh(\log(1 + N_{im}))$ models rapid initial familiarity over the first 2–3 games ($\approx 80\%$ of potential synergy) with a hard mathematical ceiling for veteran pairs.
+- **Decay Half-Life**: Elapsed time since the pair's last joint game decays synergy with a learned half-life ($\approx 845$ days).
 
-### 1.4. Inactivity Degradation & Asymmetric Knowledge Decay
-During prolonged player hiatuses ($\Delta t_i > 365$ days):
+### 1.5. Inactivity Degradation & Skill Tracking
+During player hiatuses ($\Delta t_i > 365$ days):
 $$k_i(T_{\text{target}}) = k_i \odot \exp\left(-\vec{\lambda}_{\text{decay}} \max(0, \Delta t_i - G_{\text{grace}})\right)$$
-- **Factual Knowledge** (dims $0 \dots 7$): fast decay (learned half-life $\approx 970$ days / $\approx 2.6$ years).
-- **Logical Reasoning & Intuition** (dims $8 \dots 15$): slow decay (learned half-life $\approx 6300$ days / $\approx 17$ years).
+- **Factual Knowledge**: Fast decay (learned half-life $\approx 1600$ days / $\approx 4.4$ years).
+- **Logical / Analytical Ability**: Slow decay (learned half-life $\approx 5600$ days / $\approx 15$ years).
+- **Grace Period**: $G_{\text{grace}} \approx 365.6$ days.
 
 ---
 
 ## 2. Scientific Literature & Citations
 
-The architecture and design choices are based on published research in psychometrics, rating systems, and neural collaborative filtering:
-
 1. **Item Response Theory & Team Contests**:
    - *Rasch, G. (1960).* Probabilistic Models for Some Intelligence and Attainment Tests. *Danish Institute for Educational Research*. [DOI:10.1037/h0040776](https://doi.org/10.1037/h0040776)
    - *Reckase, M. D. (2009).* Multidimensional Item Response Theory. *Springer Science & Business Media*. [DOI:10.1007/978-0-387-89976-3](https://link.springer.com/book/10.1007/978-0-387-89976-3)
-   - *Herbrich, R., Minka, T., & Graepel, T. (2007).* TrueSkill™: A Bayesian Skill Rating System. *Advances in Neural Information Processing Systems (NeurIPS 2006)*, 19, 569–576. [Paper Link](https://proceedings.neurips.cc/paper_files/paper/2006/file/f44ee263952e65b3610b8ba51229d1f9-Paper.pdf)
+   - *Herbrich, R., Minka, T., & Graepel, T. (2007).* TrueSkill™: A Bayesian Skill Rating System. *NeurIPS 2006*, 19, 569–576. [Paper Link](https://proceedings.neurips.cc/paper_files/paper/2006/file/f44ee263952e65b3610b8ba51229d1f9-Paper.pdf)
    - *Nikolenko, S. I. (2020).* Collaborative Filtering and Item Response Theory for Team Competitions: Rating System for What? Where? When?. *arXiv:2008.06975*. [arXiv:2008.06975](https://arxiv.org/abs/2008.06975)
 
 2. **Synergy, Smooth-Max Pooling, and Bilinear Forms**:
    - *Blume, L. E. (1993).* The Statistical Mechanics of Strategic Interaction. *Games and Economic Behavior*, 5(3), 387–424. [DOI:10.1006/game.1993.1023](https://doi.org/10.1006/game.1993.1023)
-   - *Koren, Y. (2008).* Factorization Meets the Neighborhood: A Multifaceted Collaborative Filtering Model. *Proceedings of the 14th ACM SIGKDD International Conference on Knowledge Discovery and Data Mining (KDD '08)*, 426–434. [DOI:10.1145/1401890.1401944](https://doi.org/10.1145/1401890.1401944)
-   - *He, X., Liao, L., Zhang, H., Nie, L., Hu, X., & Chua, T. S. (2017).* Neural Collaborative Filtering. *Proceedings of the 26th International Conference on World Wide Web (WWW '17)*, 173–182. [DOI:10.1145/3038912.3052569](https://doi.org/10.1145/3038912.3052569)
+   - *Koren, Y. (2008).* Factorization Meets the Neighborhood: A Multifaceted Collaborative Filtering Model. *ACM SIGKDD (KDD '08)*, 426–434. [DOI:10.1145/1401890.1401944](https://doi.org/10.1145/1401890.1401944)
+   - *He, X., Liao, L., Zhang, H., Nie, L., Hu, X., & Chua, T. S. (2017).* Neural Collaborative Filtering. *WWW '17*, 173–182. [DOI:10.1145/3038912.3052569](https://doi.org/10.1145/3038912.3052569)
 
 3. **Memory Decay & Temporal Skill Tracking**:
    - *Ebbinghaus, H. (1885).* Über das Gedächtnis: Untersuchungen zur experimentellen Psychologie. *Duncker & Humblot*.
-   - *Glickman, M. E. (1999).* Parameter Estimation in Large Dynamic Paired Comparison Experiments. *Journal of the Royal Statistical Society: Series C (Applied Statistics)*, 48(3), 377–394. [DOI:10.1111/1467-9876.00159](https://doi.org/10.1111/1467-9876.00159)
+   - *Glickman, M. E. (1999).* Parameter Estimation in Large Dynamic Paired Comparison Experiments. *Journal of the Royal Statistical Society: Series C*, 48(3), 377–394. [DOI:10.1111/1467-9876.00159](https://doi.org/10.1111/1467-9876.00159)
    - *Koren, Y. (2009).* Collaborative Filtering with Temporal Dynamics. *Communications of the ACM*, 53(4), 89–97. [DOI:10.1145/1721654.1721677](https://doi.org/10.1145/1721654.1721677)
 
-4. **Marginal Attribution & Shapley Value in Team Sports**:
-   - *Shapley, L. S. (1953).* A Value for n-Person Games. *Contributions to the Theory of Games*, 2(28), 307–317.
-   - *Lundberg, S. M., & Lee, S. I. (2017).* A Unified Approach to Interpreting Model Predictions. *Advances in Neural Information Processing Systems (NeurIPS 2017)*, 30. [arXiv:1705.07874](https://arxiv.org/abs/1705.07874)
-
 ---
 
-## 3. Empirical Evaluation & Benchmark Results
+## 3. Data Sources & Ingestion Pipeline
 
-Trained on **18,020,888** team question response observations across **6,980 tournaments** (spanning 2020–2026), split strictly chronologically:
-- **Train Set**: 80% (14,416,710 records)
-- **Validation Set**: 10% (1,802,089 records)
-- **Out-of-Time Test Set**: 10% (1,802,089 records)
-
-### Benchmark Performance on Test Tournaments
-
-| Metric | Baseline Linear Rasch / TrueSkill | Dual Latent Embedding + Synergy + SmoothMax | Interpretation |
-| :--- | :---: | :---: | :--- |
-| **Pairwise Team Match Win Accuracy** | `73.20%` | **`80.19%`** | Probability of correctly forecasting which team ranks higher in a head-to-head matchup |
-| **Median Spearman Rank Correlation ($\rho$)** | `0.6580` | **`0.7325`** | Monotonic rank alignment between predicted and actual tournament standings |
-| **Mean Spearman Rank Correlation ($\rho$)** | `0.6420` | **`0.7120`** | Average across diverse packages and team counts |
-| **Kendall Tau Rank Correlation ($\tau$)** | `0.4850` | **`0.5432`** | Concordant vs discordant pair ratio |
-| **Pearson Solves Correlation ($r$)** | `0.6410` | **`0.7113`** | Linear correlation with raw question solve count |
-| **Question Binary ROC-AUC** | `0.5980` | **`0.6370`** | In-game stochastic single-question prediction |
-
----
-
-## 4. Data Sources & Ingestion Pipeline
-
-The project integrates two primary community data sources:
+The system continuously synchronizes two official community data sources:
 
 1. **Official Rating Site API** ([`api.rating.chgk.info`](https://api.rating.chgk.info/)):
-   - Automated ingestion of official tournament metadata, dates, editor IDs, team rosters, and binary question masks.
-   - **Venue-Level Format Detection**: Synchronous/asynchronous packages played remotely via Zoom/Discord are tagged at team level as `online`, while club venue plays remain `sync`/`offline`.
-   - SQLite response cache with token-bucket rate limiter: `data/chgk_cache.db`.
-   - Consolidated Parquet dataset: `data/dataset.parquet`.
+   - **Tournament Coverage**: **7,104 tournaments** spanning 2020–2026.
+   - **Records**: **18,101,036 team question responses** stored in `data/dataset.parquet`.
+   - **Metadata & Cache**: SQLite response cache (`data/chgk_cache.db`) containing raw tournament cards, question quantities, editor lists, rosters, and mask strings.
+   - **Incremental Synchronization**: Automatically tracks `rating_last_sync` timestamp and invalidates cache only for edited tournaments.
 
-2. **GotQuestions Package Knowledge Base** ([`gotquestions.online`](https://gotquestions.online/)):
-   - Structured ingestion of question texts, accepted answers, authors, and per-tour editors.
-   - Polite sequential crawler with automatic backoff and immediate halt on HTTP 429.
-   - Cached questions: **513,954 questions** across **6,906 packages** (`data/gotquestions_questions.parquet`, `data/gotquestions_packs.parquet`).
+2. **GotQuestions Knowledge Base** ([`gotquestions.online`](https://gotquestions.online/)):
+   - **Packages**: **6,978 packages** in `data/gotquestions_packs.parquet`.
+   - **Questions**: **518,454 questions** with texts, accepted answers, authors, and per-tour editors in `data/gotquestions_questions.parquet`.
+   - **Linked Coverage**: **110,261 questions** directly matched between rating observations and question texts/author profiles.
+   - **Polite Ingestion**: Rate-limited crawler with automatic backoff and immediate halt on HTTP 429.
 
 ---
 
-## 5. Quickstart & Usage
+## 4. Empirical Evaluation & Test Metrics
 
-### 5.1. Environment Setup
+Model evaluated on **10,442,150 training observations** (95%), **274,793 validation observations** (2.5%), and **274,794 out-of-time test observations** (2.5%):
+
+| Metric | Baseline Linear Rasch / Elo | Previous High-Dim Model | Dual Latent ($D=6, M=3, DL_{\text{intrinsic}}$) |
+| :--- | :---: | :---: | :---: |
+| **Test ROC-AUC** | 0.5980 | 0.6898 | **0.6923** |
+| **Test LogLoss** | 0.6720 | 0.6358 | **0.6339** |
+| **Test Brier Score** | 0.2410 | 0.2227 | **0.2218** |
+| **Best Val LogLoss** | 0.6800 | 0.6436 | **0.6421** |
+
+---
+
+## 5. Quickstart & CLI Usage
+
+### 5.1. Installation & Environment Setup
 ```bash
 # Python 3.13 virtual environment
 uv venv --python 3.13 .venv
 source .venv/bin/activate
 uv pip install -r requirements.txt
 
-# Run test suite (37 passing tests)
+# Run complete test suite (38 passing tests)
 pytest tests/
 ```
 
-### 5.2. Data Updating & Crawling
+### 5.2. Incremental Data Updates
 ```bash
-# Incrementally sync recent tournaments from api.rating.chgk.info
-chgk-rating update-rating --lookback-days 14
+# Incrementally update tournament results from api.rating.chgk.info
+python cli.py update-rating --lookback-days 14
 
 # Incrementally sync question packages from gotquestions.online
-chgk-rating fetch-questions --lookback-packs 20 --rate-limit 1.5
+python cli.py fetch-questions --lookback-packs 20 --rate-limit 2.0
 ```
 
 ### 5.3. Training the Model
 ```bash
-# Train on Apple Silicon GPU (MPS) or CUDA
-chgk-rating train --dim-k 16 --dim-c 8 --epochs 5 --batch-size 4096 --device auto
+# Train on CPU or Apple Silicon
+python cli.py train --dim-k 6 --dim-c 3 --epochs 5 --batch-size 4096 --device cpu
 ```
 
-### 5.4. Tournament Simulation & Matchup Prediction
+### 5.4. Universal Tournament Prediction (Any Tournament ID)
+Predict tournament standings, expected score distribution, win probabilities, and generate interactive HTML reports for **any tournament ID**:
+
 ```bash
-# Predict head-to-head match with calibrated editor difficulty
-chgk-rating predict-match \
-  --team-a 27403,28751,21026,74001,40393,7008 \
-  --team-b 15501,21233,34909,37730,9342,25654 \
-  --target-dl 4.5 \
-  --editors 20700,25373 \
-  --format offline
+# Predict via CLI command
+python cli.py predict-tournament 14149
+python cli.py predict-tournament 10000
 
-# Monte Carlo tournament simulation with predicted standings
-chgk-rating simulate-tournament \
-  --teams-file data/sample_teams.json \
-  --target-dl 5.0 \
-  --editors 20700,25373 \
-  --questions 36 \
-  --format offline \
-  --simulations 3000
+# Or run via universal prediction script
+python scripts/predict_tournament.py 14149
+python scripts/predict_tournament.py 10000 --simulations 10000
 ```
 
-### 5.5. FastAPI Production Service
+#### Available Prediction Options:
+- `--simulations <N>`: Number of Monte Carlo simulation runs (default: 10,000).
+- `--tactical / --no-tactical`: Optimize 6-person lineups per tour for teams with substitutions (>6 players).
+- `--refresh`: Force refresh tournament data and rosters from the official API.
+- `--dl-override <FLOAT>`: Override package TrueDL for sensitivity analysis.
+- `--html / --no-html`: Automatically generates a responsive HTML report (`data/forecast_{ID}.html`).
+
+### 5.5. REST API Service
 ```bash
-chgk-rating run-api --host 0.0.0.0 --port 8000
+python cli.py run-api --host 0.0.0.0 --port 8000
 ```
-Interactive OpenAPI documentation is available at `http://localhost:8000/docs`.
+OpenAPI documentation available at `http://localhost:8000/docs`.
 
 ---
 

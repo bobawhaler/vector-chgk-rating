@@ -115,6 +115,9 @@ def fetch_data(
 @click.option("--lr", default=1e-3, type=float, help="Learning rate for AdamW")
 @click.option("--weight-decay", default=1e-4, type=float, help="L2 regularization")
 @click.option("--device", default="auto", help="Execution device: auto, cpu, or mps")
+@click.option("--train-ratio", default=0.95, type=float, help="Ratio for training set")
+@click.option("--val-ratio", default=0.025, type=float, help="Ratio for validation set")
+@click.option("--min-date", default="2023-01-01", type=str, help="Filter tournaments from this date")
 @click.option("--data-path", default=str(DEFAULT_PARQUET_PATH), help="Path to Parquet dataset")
 @click.option("--model-path", default=str(DEFAULT_MODEL_PATH), help="Path to save best model")
 @click.option("--meta-path", default=str(DEFAULT_META_PATH), help="Path to save dataset metadata")
@@ -126,6 +129,9 @@ def train(
     lr: float,
     weight_decay: float,
     device: str,
+    train_ratio: float,
+    val_ratio: float,
+    min_date: Optional[str],
     data_path: str,
     model_path: str,
     meta_path: str,
@@ -138,7 +144,15 @@ def train(
 
     target_device = device
     if device == "auto":
-        target_device = "mps" if torch.backends.mps.is_available() else "cpu"
+        target_device = "cpu"
+        if torch.backends.mps.is_available():
+            try:
+                # Test MPS capability
+                t1 = torch.zeros((2, 2), dtype=torch.bool, device="mps")
+                _ = t1 & t1
+                target_device = "mps"
+            except Exception:
+                target_device = "cpu"
 
     cfg = ModelConfig(
         dim_k=dim_k,
@@ -148,6 +162,9 @@ def train(
         learning_rate=lr,
         weight_decay=weight_decay,
         device=target_device,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        min_date=min_date if (min_date and min_date.strip().lower() not in ("none", "")) else None,
     )
 
     click.echo(
@@ -177,10 +194,20 @@ def train(
 
 
 @cli.command("evaluate")
+@click.option("--train-ratio", default=0.95, type=float, help="Ratio for training set")
+@click.option("--val-ratio", default=0.025, type=float, help="Ratio for validation set")
+@click.option("--min-date", default="2023-01-01", type=str, help="Filter tournaments from this date")
 @click.option("--data-path", default=str(DEFAULT_PARQUET_PATH), help="Path to Parquet dataset")
 @click.option("--model-path", default=str(DEFAULT_MODEL_PATH), help="Path to trained model")
 @click.option("--meta-path", default=str(DEFAULT_META_PATH), help="Path to dataset metadata")
-def evaluate(data_path: str, model_path: str, meta_path: str) -> None:
+def evaluate(
+    train_ratio: float,
+    val_ratio: float,
+    min_date: Optional[str],
+    data_path: str,
+    model_path: str,
+    meta_path: str,
+) -> None:
     """Evaluate trained model on dataset and display metrics."""
     m_path = Path(model_path)
     meta_p = Path(meta_path)
@@ -194,7 +221,13 @@ def evaluate(data_path: str, model_path: str, meta_path: str) -> None:
 
     model, metadata = load_model_and_metadata(m_path, meta_p)
     df = pd.read_parquet(data_path)
-    _, _, test_df = split_data_chronologically(df)
+    clean_min_date = min_date if (min_date and min_date.strip().lower() not in ("none", "")) else None
+    _, _, test_df = split_data_chronologically(
+        df,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        min_date=clean_min_date,
+    )
 
     test_dataset = ChGKDataset(test_df, metadata)
     test_loader = DataLoader(test_dataset, batch_size=4096, shuffle=False)
@@ -689,3 +722,46 @@ def simulate_tournament_cmd(
             f"{row['prob_top_3']:<9.1%}"
         )
     click.echo("=============================================================================\n")
+
+
+@cli.command("predict-tournament")
+@click.argument("tournament_id", type=int)
+@click.option("--simulations", default=10000, type=int, help="Number of Monte Carlo simulations")
+@click.option("--tactical/--no-tactical", default=True, help="Enable tactical tour-by-tour roster optimization")
+@click.option("--refresh", is_flag=True, default=False, help="Force refresh data from official API")
+@click.option("--dl-override", default=None, type=float, help="Override package TrueDL for sensitivity analysis")
+@click.option("--html/--no-html", "gen_html", default=True, help="Generate interactive HTML report")
+@click.option("--output-dir", default="data", help="Output directory for JSON and HTML reports")
+def predict_tournament_cmd(
+    tournament_id: int,
+    simulations: int,
+    tactical: bool,
+    refresh: bool,
+    dl_override: Optional[float],
+    gen_html: bool,
+    output_dir: str,
+) -> None:
+    """Predict tournament standings, expected score distribution, and win probabilities for any tournament ID."""
+    from chgk_rating.tournament_predictor import TournamentPredictor
+
+    predictor = TournamentPredictor()
+    click.echo(f"Running two-stage rating forecast for tournament ID {tournament_id}...")
+
+    res = predictor.predict_tournament(
+        tournament_id=tournament_id,
+        num_simulations=simulations,
+        tactical=tactical,
+        force_refresh=refresh,
+        tournament_dl_override=dl_override,
+    )
+
+    out_d = Path(output_dir)
+    json_path = predictor.export_json(res, out_d / f"forecast_{tournament_id}.json")
+    click.echo(f"Saved forecast JSON to {json_path}")
+
+    if gen_html:
+        html_path = predictor.export_html(res, out_d / f"forecast_{tournament_id}.html")
+        click.echo(f"Saved interactive HTML report to {html_path}")
+
+    click.echo("\n" + predictor.format_terminal_table(res) + "\n")
+

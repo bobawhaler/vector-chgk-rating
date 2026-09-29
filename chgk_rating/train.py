@@ -28,14 +28,26 @@ logger = logging.getLogger(__name__)
 
 
 def split_data_chronologically(
-    df: pd.DataFrame, train_ratio: float = 0.8, val_ratio: float = 0.1
+    df: pd.DataFrame,
+    train_ratio: float = 0.95,
+    val_ratio: float = 0.025,
+    min_date: Optional[str] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Split dataset chronologically based on tournament date."""
+    if min_date is not None:
+        df = df[df["date"] >= min_date].copy()
+
     # Ensure sorted by date and tournament_id
     sorted_df = df.sort_values(by=["date", "tournament_id"]).reset_index(drop=True)
     n = len(sorted_df)
     train_end = int(n * train_ratio)
     val_end = int(n * (train_ratio + val_ratio))
+
+    if n >= 3:
+        if val_end >= n:
+            val_end = n - 1
+        if train_end >= val_end:
+            train_end = max(1, val_end - 1)
 
     train_df = sorted_df.iloc[:train_end].copy()
     val_df = sorted_df.iloc[train_end:val_end].copy()
@@ -78,6 +90,9 @@ def evaluate_model(
             pairwise_exp = batch.get("pairwise_exp")
             if pairwise_exp is not None:
                 pairwise_exp = pairwise_exp.to(device)
+            tournament_dl = batch.get("tournament_dl")
+            if tournament_dl is not None:
+                tournament_dl = tournament_dl.to(device)
 
             out = model(
                 player_ids=player_ids,
@@ -86,6 +101,7 @@ def evaluate_model(
                 player_delta_t=player_delta_t,
                 pairwise_delta_t=pairwise_delta_t,
                 pairwise_exp=pairwise_exp,
+                tournament_dl=tournament_dl,
             )
             probs = out["probs"].squeeze(-1).cpu().numpy().tolist()
             targets = labels.squeeze(-1).cpu().numpy().tolist()
@@ -126,7 +142,12 @@ def train_model(
 
     # 1. Load data
     df = pd.read_parquet(parquet_path)
-    train_df, val_df, test_df = split_data_chronologically(df)
+    train_df, val_df, test_df = split_data_chronologically(
+        df,
+        train_ratio=cfg.train_ratio,
+        val_ratio=cfg.val_ratio,
+        min_date=cfg.min_date,
+    )
 
     # 2. Build indexers
     all_players: set[str] = set()
@@ -161,12 +182,12 @@ def train_model(
         editor_indexer=editor_indexer,
         question_indexer=question_indexer,
     )
-    metadata.save(meta_save_path)
 
     # 3. Create datasets & dataloaders
     train_dataset = ChGKDataset(train_df, metadata, tournament_editors_map=tournament_editors_map)
     val_dataset = ChGKDataset(val_df, metadata, tournament_editors_map=tournament_editors_map)
     test_dataset = ChGKDataset(test_df, metadata, tournament_editors_map=tournament_editors_map)
+    metadata.save(meta_save_path)
 
     train_loader = DataLoader(
         train_dataset, batch_size=cfg.batch_size, shuffle=True, drop_last=False
@@ -217,6 +238,9 @@ def train_model(
             pairwise_exp = batch.get("pairwise_exp")
             if pairwise_exp is not None:
                 pairwise_exp = pairwise_exp.to(device)
+            tournament_dl = batch.get("tournament_dl")
+            if tournament_dl is not None:
+                tournament_dl = tournament_dl.to(device)
 
             optimizer.zero_grad()
             out = model(
@@ -226,6 +250,7 @@ def train_model(
                 player_delta_t=player_delta_t,
                 pairwise_delta_t=pairwise_delta_t,
                 pairwise_exp=pairwise_exp,
+                tournament_dl=tournament_dl,
             )
             logits = out["logits"]
             bce_loss = criterion(logits, labels)

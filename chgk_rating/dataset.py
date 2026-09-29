@@ -153,15 +153,20 @@ class ChGKDataset(Dataset):
         q_idxer = metadata.question_indexer
         fmt_map = metadata.format_map
 
-        # If tournament_editors_map not provided, lazily load from editor_registry
+        # Load tournament metadata from editor_registry
+        from chgk_rating.editor_analytics import get_editor_registry
+        reg = get_editor_registry()
+        reg.load_data()
+
         if tournament_editors_map is None:
-            from chgk_rating.editor_analytics import get_editor_registry
-            reg = get_editor_registry()
-            reg.load_data()
             tournament_editors_map = {
                 tid: meta["editor_ids"]
                 for tid, meta in reg._tournament_metadata.items()
             }
+        tournament_dl_map = {
+            tid: float(meta.get("intrinsic_true_dl") or meta.get("true_dl") or meta.get("forecast_dl") or 4.25)
+            for tid, meta in reg._tournament_metadata.items()
+        }
 
         # Sort chronologically to compute realistic running gaps
         sorted_df = df.sort_values(by=["date", "tournament_id"]).reset_index(drop=True)
@@ -195,6 +200,7 @@ class ChGKDataset(Dataset):
         question_ids_arr = np.zeros(total_rows, dtype=np.int64)
         format_ids_arr = np.zeros(total_rows, dtype=np.int64)
         labels_arr = np.zeros((total_rows, 1), dtype=np.float32)
+        tournament_dls_arr = np.zeros(total_rows, dtype=np.float32)
         player_deltas_arr = np.zeros((total_rows, max_players_per_team), dtype=np.float32)
         pairwise_deltas_arr = np.zeros(
             (total_rows, max_players_per_team, max_players_per_team), dtype=np.float32
@@ -319,6 +325,8 @@ class ChGKDataset(Dataset):
             question_ids_arr[count] = q_idx
             format_ids_arr[count] = fmt_id
             labels_arr[count, 0] = solved_val
+            t_dl_val = tournament_dl_map.get(int(t_id_val), 4.25)
+            tournament_dls_arr[count] = float(t_dl_val)
             player_deltas_arr[count] = p_deltas
             pairwise_deltas_arr[count] = pair_mat
             pairwise_exp_arr[count] = exp_mat
@@ -337,6 +345,7 @@ class ChGKDataset(Dataset):
         self.question_ids = torch.from_numpy(question_ids_arr[:count])
         self.format_ids = torch.from_numpy(format_ids_arr[:count])
         self.labels = torch.from_numpy(labels_arr[:count])
+        self.tournament_dls = torch.from_numpy(tournament_dls_arr[:count])
         self.player_delta_ts = torch.from_numpy(player_deltas_arr[:count])
         self.pairwise_delta_ts = torch.from_numpy(pairwise_deltas_arr[:count])
         self.pairwise_exp = torch.from_numpy(pairwise_exp_arr[:count])
@@ -351,6 +360,7 @@ class ChGKDataset(Dataset):
             "question_id": self.question_ids[idx],
             "format_id": self.format_ids[idx],
             "label": self.labels[idx],
+            "tournament_dl": self.tournament_dls[idx],
             "player_delta_t": self.player_delta_ts[idx],
             "pairwise_delta_t": self.pairwise_delta_ts[idx],
             "pairwise_exp": self.pairwise_exp[idx],

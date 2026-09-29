@@ -21,13 +21,15 @@ build/
 dist/
 *.egg-info/
 
-# Data & Models (generated cache and weights)
+# Data & Models (generated cache, datasets, weights, forecasts)
 data/*.db
 data/*.parquet
 data/embeddings/
+data/forecast_*.json
+data/forecast_*.html
 models/*.pt
 models/*.json
-
-# Operating System
+*.log
 .DS_Store
 Thumbs.db
+

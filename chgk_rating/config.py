@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Final
+from typing import Dict, Final, Optional
 
 # Base Paths
 BASE_DIR: Final[Path] = Path(__file__).resolve().parent.parent
@@ -44,8 +44,8 @@ DEFAULT_GQ_PACKS_PARQUET: Final[Path] = DATA_DIR / "gotquestions_packs.parquet"
 class ModelConfig:
     """Hyperparameters for DualEmbeddingChGKModel."""
 
-    dim_k: int = 16  # Knowledge latent dimension D
-    dim_c: int = 8   # Communication & format latent dimension M
+    dim_k: int = 6  # Knowledge latent dimension D (1 general + 5 macro-topics)
+    dim_c: int = 3  # Communication & format latent dimension M (3 core team roles)
     num_formats: int = NUM_FORMATS
     weight_decay: float = 1e-4
     learning_rate: float = 1e-3
@@ -53,6 +53,9 @@ class ModelConfig:
     epochs: int = 20
     device: str = "cpu"
     rank_loss_weight: float = 0.1  # Weight for pairwise margin ranking loss in training
+    train_ratio: float = 0.95      # 95% training set
+    val_ratio: float = 0.025       # 2.5% validation set (remaining 2.5% test set)
+    min_date: Optional[str] = None # Filter tournaments from this date (e.g. '2023-01-01')
 
 
 @dataclass

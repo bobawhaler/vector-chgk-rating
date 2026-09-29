@@ -522,6 +522,8 @@ def predict_team_match(
         mapped_e = [0]
     e_ten = torch.tensor([mapped_e], dtype=torch.long)
 
+    t_dl_ten = torch.tensor([[calibrated_dl]], dtype=torch.float32)
+
     def get_team_tensor(players: List[Union[int, str]]) -> torch.Tensor:
         indices = [p_indexer.get_idx(p, default=0) for p in players[:6]]
         while len(indices) < 6:
@@ -531,11 +533,10 @@ def predict_team_match(
     t_a_ten = get_team_tensor(team_a_players)
     t_b_ten = get_team_tensor(team_b_players)
     f_ten = torch.tensor([fmt_id], dtype=torch.long)
-    b_ten = torch.tensor([[expected_b]], dtype=torch.float32)
 
     with torch.no_grad():
-        out_a = model(player_ids=t_a_ten, editor_ids=e_ten, format_ids=f_ten, expected_difficulty=b_ten)
-        out_b = model(player_ids=t_b_ten, editor_ids=e_ten, format_ids=f_ten, expected_difficulty=b_ten)
+        out_a = model(player_ids=t_a_ten, editor_ids=e_ten, format_ids=f_ten, tournament_dl=t_dl_ten)
+        out_b = model(player_ids=t_b_ten, editor_ids=e_ten, format_ids=f_ten, tournament_dl=t_dl_ten)
         p_a = float(out_a["probs"][0, 0].item())
         p_b = float(out_b["probs"][0, 0].item())
 
@@ -585,7 +586,7 @@ def simulate_tournament(
     ed_indexer = metadata.editor_indexer
     fmt_id = metadata.format_map.get(format_name.lower(), 0)
     f_ten = torch.tensor([fmt_id], dtype=torch.long)
-    b_ten = torch.tensor([[expected_b]], dtype=torch.float32)
+    t_dl_ten = torch.tensor([[calibrated_dl]], dtype=torch.float32)
 
     mapped_e = []
     if editor_ids:
@@ -625,7 +626,7 @@ def simulate_tournament(
                 editor_ids=e_ten,
                 format_ids=f_ten,
                 pairwise_exp=exp_ten,
-                expected_difficulty=b_ten,
+                tournament_dl=t_dl_ten,
             )
             solve_probs[name] = float(out["probs"][0, 0].item())
 

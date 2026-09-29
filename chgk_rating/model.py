@@ -26,8 +26,8 @@ class DualEmbeddingChGKModel(nn.Module):
         num_players: int,
         num_editors: int = 2000,
         num_questions: int = 1,
-        dim_k: int = 16,
-        dim_c: int = 8,
+        dim_k: int = 6,
+        dim_c: int = 3,
         num_formats: int = 3,
         padding_player_idx: int = 0,
         padding_editor_idx: int = 0,
@@ -116,12 +116,21 @@ class DualEmbeddingChGKModel(nn.Module):
         self.online_anomaly_weight = nn.Parameter(torch.zeros(1))
 
         # Experience scaling for synergy: S_im * (1.0 + beta_exp * log(1 + N_im))
-        # Initialized to softplus^{-1}(0.2) ~ -1.5 so beta_exp starts positive and small
-        self.raw_exp_weight = nn.Parameter(torch.tensor(-1.5))
+        # Initialized to 0.0 so beta_exp starts at 0.20 * sigmoid(0) = 0.10
+        self.raw_exp_weight = nn.Parameter(torch.tensor(0.0))
 
         # Smooth-max temperature for knowledge pooling: tau * logsumexp(k / tau)
         # Initialized to softplus^{-1}(0.5) so tau starts around 0.5 (approaching hard max smoothly)
         self.raw_smoothmax_temp = nn.Parameter(torch.tensor(0.0))
+
+        # Two-Stage Tournament Difficulty Conditioning
+        # Baseline DL is 4.25 (mean historical TrueDL across all tournaments)
+        self.tournament_dl_baseline = 4.25
+        self.dl_sensitivity = nn.Parameter(torch.tensor(0.18))
+
+        # Synergy weight in final logit: z_final = z_know + w_syn * s_team + b_f + z_anomaly
+        # w_syn = torch.sigmoid(self.raw_synergy_weight) ~ 0.50 initially
+        self.raw_synergy_weight = nn.Parameter(torch.tensor(0.0))
 
     def get_effective_communication(
         self, player_ids: torch.Tensor, format_ids: torch.Tensor
@@ -174,10 +183,14 @@ class DualEmbeddingChGKModel(nn.Module):
         # S_mat: (B, K, K) = C_W * C^T
         s_mat = torch.matmul(c_w, c_eff.transpose(-1, -2))  # (B, K, K)
 
-        # Apply experience scaling from historical joint games: (1.0 + beta_exp * log(1 + N_games))
+        # Apply experience scaling with rapid initial learning (80% in 1-2 games) and hard ceiling:
         if pairwise_exp is not None:
-            beta_exp = F.softplus(self.raw_exp_weight)
-            exp_scaling = 1.0 + beta_exp * pairwise_exp
+            # beta_exp bounded in [0, 0.20] via sigmoid so experience cannot overwhelm role chemistry
+            beta_exp = 0.20 * torch.sigmoid(self.raw_exp_weight)
+            # pairwise_exp is log(1 + N_games). Using tanh(pairwise_exp) achieves:
+            # N=0 -> 0.0, N=1 -> 0.60, N=2 -> 0.80, N=5 -> 0.94, N->inf -> 1.00
+            sat_exp = torch.tanh(pairwise_exp)
+            exp_scaling = 1.0 + beta_exp * sat_exp
             s_mat = s_mat * exp_scaling
 
         # Apply pairwise time decay if elapsed time provided
@@ -198,7 +211,7 @@ class DualEmbeddingChGKModel(nn.Module):
         pairwise_delta_t: Optional[torch.Tensor] = None,
         pairwise_exp: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Compute total team synergy: S_team = sum_{i < m} S_im.
+        """Compute total team synergy as mean pairwise compatibility: S_team = sum_{i < m} S_im / max(1, N_pairs).
 
         Args:
             c_eff: Tensor of shape (B, K, M)
@@ -215,8 +228,18 @@ class DualEmbeddingChGKModel(nn.Module):
         # Extract upper triangle strictly above diagonal (i < m)
         k = s_mat.size(-1)
         triu_indices = torch.triu_indices(k, k, offset=1, device=s_mat.device)
-        s_team = s_mat[:, triu_indices[0], triu_indices[1]].sum(dim=-1, keepdim=True)
-        return s_team  # (B, 1)
+        s_team_raw = s_mat[:, triu_indices[0], triu_indices[1]].sum(dim=-1, keepdim=True)
+
+        # Scale by max(1, N_pairs) to compute mean pairwise synergy (intensive team chemistry)
+        if player_mask is not None:
+            n_valid = player_mask.float().sum(dim=-1, keepdim=True)
+            n_pairs = (n_valid * (n_valid - 1.0)) / 2.0
+            scale = torch.clamp(n_pairs, min=1.0)
+        else:
+            n_pairs = float(k * (k - 1)) / 2.0
+            scale = max(1.0, n_pairs)
+
+        return s_team_raw / scale
 
     def forward(
         self,
@@ -229,9 +252,10 @@ class DualEmbeddingChGKModel(nn.Module):
         player_delta_t: Optional[torch.Tensor] = None,
         pairwise_delta_t: Optional[torch.Tensor] = None,
         pairwise_exp: Optional[torch.Tensor] = None,
+        tournament_dl: Optional[torch.Tensor] = None,
         expected_difficulty: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Forward pass for a batch of team observations conditioned on editors and format.
+        """Forward pass for a batch of team observations conditioned on editors, tournament difficulty, and format.
 
         Args:
             player_ids: LongTensor of shape (B, K) - roster player indices
@@ -243,6 +267,7 @@ class DualEmbeddingChGKModel(nn.Module):
             player_delta_t: Optional FloatTensor of shape (B, K) - elapsed days since last game per player
             pairwise_delta_t: Optional FloatTensor of shape (B, K, K) - elapsed days since last joint game per pair
             pairwise_exp: Optional FloatTensor of shape (B, K, K) - log(1 + joint games count) per pair
+            tournament_dl: Optional FloatTensor of shape (B, 1) or (B,) - calibrated/true tournament difficulty
             expected_difficulty: Optional FloatTensor of shape (B, 1) or (B,) - optional difficulty override
 
         Returns:
@@ -252,6 +277,9 @@ class DualEmbeddingChGKModel(nn.Module):
                 - 'p_gen': P_gen (B, 1)
                 - 'z_know': z_know (B, 1)
                 - 's_team': S_team (B, 1)
+                - 'w_syn': w_syn (1,)
+                - 'b_format': b_f (B, 1)
+                - 'b_pkg': b_pkg (B, 1)
                 - 'z_anomaly': z_anomaly (B, 1)
                 - 'k_team': K_team (B, D)
         """
@@ -320,8 +348,14 @@ class DualEmbeddingChGKModel(nn.Module):
             e_pkg = self.global_editor_vec.unsqueeze(0).expand(batch_size, -1)  # (B, D)
             b_pkg = self.global_editor_b.unsqueeze(0).expand(batch_size, -1)    # (B, 1)
 
-        # Allow explicit difficulty override if supplied
-        if expected_difficulty is not None:
+        # Allow explicit difficulty override or two-stage calibrated difficulty
+        if tournament_dl is not None:
+            if tournament_dl.dim() == 1:
+                t_dl = tournament_dl.unsqueeze(-1)
+            else:
+                t_dl = tournament_dl
+            b_pkg = b_pkg + self.dl_sensitivity * (t_dl - self.tournament_dl_baseline)
+        elif expected_difficulty is not None:
             if expected_difficulty.dim() == 1:
                 b_pkg = expected_difficulty.unsqueeze(-1)
             else:
@@ -349,9 +383,11 @@ class DualEmbeddingChGKModel(nn.Module):
             z_anomaly = is_online * factual_factor * self.online_anomaly_weight
 
         # 5. Final Solved Probability:
-        # P_final = sigmoid(logit(P_gen) + S_team + b_f + z_anomaly)
+        # P_final = sigmoid(logit(P_gen) + w_syn * S_team + b_f + z_anomaly)
         b_f = self.format_bias(format_ids)  # (B, 1)
-        z_final = z_know + s_team + b_f + z_anomaly
+        # Bounded synergy weight in [0, 0.25] so team chemistry cannot overwhelm individual knowledge
+        w_syn = 0.25 * torch.sigmoid(self.raw_synergy_weight)
+        z_final = z_know + w_syn * s_team + b_f + z_anomaly
         p_final = torch.sigmoid(z_final)
 
         return {
@@ -360,7 +396,9 @@ class DualEmbeddingChGKModel(nn.Module):
             "p_gen": p_gen,
             "z_know": z_know,
             "s_team": s_team,
+            "w_syn": w_syn,
             "b_format": b_f,
+            "b_pkg": b_pkg,
             "z_anomaly": z_anomaly,
             "k_team": k_team,
         }
@@ -374,6 +412,8 @@ class DualEmbeddingChGKModel(nn.Module):
             + torch.norm(self.editor_emb.weight) ** 2
             + torch.norm(self.editor_b.weight) ** 2
             + torch.norm(self.W_synergy) ** 2
+            + torch.norm(self.dl_sensitivity) ** 2
+            + torch.norm(self.raw_synergy_weight) ** 2
         )
         if hasattr(self, "player_k_online"):
             # 10x stronger penalty on online knowledge deviation (Bayesian shrinkage towards offline base)
