@@ -11,6 +11,9 @@ env/
 venv/
 ENV/
 
+# App Engine secrets (see gae/env_template.yaml)
+env.yaml
+
 # Testing & Coverage
 .pytest_cache/
 .coverage

@@ -1,0 +1,22 @@
+[project]
+name = "chgk-rating-gae"
+version = "0.1.0"
+description = "App Engine control service for the ChGK rating project"
+requires-python = ">=3.12"
+dependencies = [
+    "flask>=3.0.0",
+    "gunicorn>=22.0.0",
+    "requests>=2.32.0",
+    "pyyaml>=6.0.1",
+    "google-cloud-datastore>=2.20.0",
+    "google-cloud-tasks>=2.16.0",
+    "google-cloud-storage>=2.18.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.uv]
+package = false

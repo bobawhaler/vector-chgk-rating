@@ -1,0 +1,21 @@
+[
+  {
+    "name": "keep-recent-2",
+    "action": {
+      "type": "Keep"
+    },
+    "mostRecentVersions": {
+      "keepCount": 2
+    }
+  },
+  {
+    "name": "delete-old-7d",
+    "action": {
+      "type": "Delete"
+    },
+    "condition": {
+      "olderThan": "604800s",
+      "tagState": "any"
+    }
+  }
+]

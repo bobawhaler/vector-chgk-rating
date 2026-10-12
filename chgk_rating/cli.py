@@ -493,7 +493,7 @@ def update_rating(since_date: Optional[str], lookback_days: int, data_path: str)
 @cli.command("fetch-questions")
 @click.option("--lookback-packs", default=50, type=int, help="Recent packs to re-check during incremental crawl")
 @click.option("--max-packs", default=None, type=int, help="Max packs to fetch (None for all until boundary)")
-@click.option("--target-max-pack", default=7125, type=int, help="Known upper bound pack ID on gotquestions")
+@click.option("--target-max-pack", default=None, type=int, help="Optional upper bound pack ID on gotquestions")
 @click.option("--rate-limit", default=1.0, type=float, help="Requests per second (gentle default 1.0)")
 @click.option("--concurrency", default=1, type=int, help="Concurrent workers (gentle default 1)")
 def fetch_questions(
@@ -531,6 +531,66 @@ def fetch_questions(
     click.echo(
         f"Export complete: {len(q_df)} questions across {len(p_df)} packages saved to {cfg.questions_parquet}"
     )
+
+
+def _gae(module: str):
+    gae_dir = Path(__file__).resolve().parents[1] / "gae"
+    if str(gae_dir) not in sys.path:
+        sys.path.append(str(gae_dir))
+    return __import__(module)
+
+
+@cli.command("upload-questions")
+@click.option("--path", default=str(DEFAULT_GQ_QUESTIONS_PARQUET), help="Local questions parquet to upload")
+def upload_questions_cmd(path: str) -> None:
+    """Upload the questions parquet to Cloud Storage as the nightly-sync baseline."""
+    click.echo(_gae("questions_sync").upload_snapshot(Path(path)))
+
+
+@cli.command("sync-questions")
+def sync_questions_cmd() -> None:
+    """Run one incremental gotquestions sync against Cloud Storage."""
+    result = _gae("questions_sync").run_incremental()
+    click.echo(result.message)
+    if not result.ok:
+        raise SystemExit(1)
+
+
+@cli.command("materialize-questions")
+@click.option("--path", default=str(DEFAULT_GQ_QUESTIONS_PARQUET), help="Where to write the merged parquet")
+def materialize_questions_cmd(path: str) -> None:
+    """Download the Cloud Storage snapshot plus nightly parts into one local parquet."""
+    click.echo(_gae("questions_sync").materialize(Path(path)))
+
+
+@cli.command("upload-rating")
+@click.option("--path", default=str(DEFAULT_PARQUET_PATH), help="Local rating parquet to upload")
+def upload_rating_cmd(path: str) -> None:
+    """Upload tournament results to Cloud Storage as the nightly-sync baseline."""
+    click.echo(_gae("rating_sync").upload_snapshot(Path(path)))
+
+
+@cli.command("sync-rating")
+def sync_rating_cmd() -> None:
+    """Run one incremental rating.chgk.info sync against Cloud Storage."""
+    result = _gae("rating_sync").run_incremental()
+    click.echo(result.message)
+    if not result.ok:
+        raise SystemExit(1)
+
+
+@cli.command("materialize-rating")
+@click.option("--path", default=str(DEFAULT_PARQUET_PATH), help="Where to write the merged rating parquet")
+def materialize_rating_cmd(path: str) -> None:
+    """Download rating snapshot plus nightly parts into one local parquet."""
+    click.echo(_gae("rating_sync").materialize(Path(path)))
+
+
+@cli.command("materialize-data")
+def materialize_data_cmd() -> None:
+    """Refresh local question and rating parquets from Cloud Storage."""
+    click.echo(_gae("questions_sync").materialize(DEFAULT_GQ_QUESTIONS_PARQUET))
+    click.echo(_gae("rating_sync").materialize(DEFAULT_PARQUET_PATH))
 
 
 @cli.command("link-questions")

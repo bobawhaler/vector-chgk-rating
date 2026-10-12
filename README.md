@@ -136,28 +136,27 @@ Model evaluated on **10,442,150 training observations** (95%), **274,793 validat
 
 ### 5.1. Installation & Environment Setup
 ```bash
-# Python 3.13 virtual environment
-uv venv --python 3.13 .venv
-source .venv/bin/activate
-uv pip install -r requirements.txt
+uv sync
 
-# Run complete test suite (38 passing tests)
-pytest tests/
+# Run complete test suite (64 passing tests)
+uv run pytest
 ```
+
+Commands below are run with `uv run`. The App Engine service in `gae/` is a separate uv project: its `requirements.txt` is exported from `gae/pyproject.toml` because App Engine installs from that file.
 
 ### 5.2. Incremental Data Updates
 ```bash
 # Incrementally update tournament results from api.rating.chgk.info
-python cli.py update-rating --lookback-days 14
+uv run python cli.py update-rating --lookback-days 14
 
 # Incrementally sync question packages from gotquestions.online
-python cli.py fetch-questions --lookback-packs 20 --rate-limit 2.0
+uv run python cli.py fetch-questions --lookback-packs 20 --rate-limit 2.0
 ```
 
 ### 5.3. Training the Model
 ```bash
 # Train on CPU or Apple Silicon
-python cli.py train --dim-k 6 --dim-c 3 --epochs 5 --batch-size 4096 --device cpu
+uv run python cli.py train --dim-k 6 --dim-c 3 --epochs 5 --batch-size 4096 --device cpu
 ```
 
 ### 5.4. Universal Tournament Prediction (Any Tournament ID)
@@ -165,12 +164,12 @@ Predict tournament standings, expected score distribution, win probabilities, an
 
 ```bash
 # Predict via CLI command
-python cli.py predict-tournament 14149
-python cli.py predict-tournament 10000
+uv run python cli.py predict-tournament 14149
+uv run python cli.py predict-tournament 10000
 
 # Or run via universal prediction script
-python scripts/predict_tournament.py 14149
-python scripts/predict_tournament.py 10000 --simulations 10000
+uv run python scripts/predict_tournament.py 14149
+uv run python scripts/predict_tournament.py 10000 --simulations 10000
 ```
 
 #### Available Prediction Options:
@@ -182,9 +181,66 @@ python scripts/predict_tournament.py 10000 --simulations 10000
 
 ### 5.5. REST API Service
 ```bash
-python cli.py run-api --host 0.0.0.0 --port 8000
+uv run python cli.py run-api --host 0.0.0.0 --port 8000
 ```
 OpenAPI documentation available at `http://localhost:8000/docs`.
+
+### 5.6. Questions database on the free tier
+
+The question corpus (~522 000 rows, 171 MB) and the tournament-result table (`dataset.parquet`, 36 MB) both live in one **Cloud Storage** bucket in a US region (`us-central1`, `us-east1`, or `us-west1`; 5 GB-months free). The SQLite files next to them (`gotquestions_cache.db` 712 MB, `chgk_cache.db` 671 MB) are local HTTP caches, not the databases cron reads.
+
+| Object | What it is | Nightly job |
+| :--- | :--- | :--- |
+| `questions/snapshot.parquet` | gotquestions texts, answers, authors | uploaded once |
+| `questions/parts/*.jsonl.gz` | packs whose text changed | 03:30 Europe/Berlin |
+| `rating/snapshot.parquet` | team×question results from rating.chgk.info | uploaded once |
+| `rating/parts/*.jsonl.gz` | tournaments edited in the last 3 days | 04:00 Europe/Berlin |
+| `state/*.json` | cursors | rewritten in place |
+
+A part replaces rows for the tournaments it names. Question rows and rating rows share `question_id` (`{tournament_id}_{n}`).
+
+Cron does not download the snapshots (an F1 instance has 256 MB of RAM). Work locally against the files the rest of the project already reads:
+
+```bash
+uv run python cli.py materialize-data
+uv run python cli.py link-questions          # how many rating questions have a text
+uv run python cli.py train --device cpu
+uv run python cli.py predict-tournament 14149
+uv run python cli.py run-api --host 0.0.0.0 --port 8000
+```
+
+`materialize-data` rewrites `data/gotquestions_questions.parquet` and `data/dataset.parquet` from the bucket. Training and the API do not talk to Cloud Storage themselves.
+
+```bash
+gcloud storage buckets create gs://PROJECT_ID-chgk-data \
+  --location=us-central1 --uniform-bucket-level-access
+gcloud storage buckets add-iam-policy-binding gs://PROJECT_ID-chgk-data \
+  --member=serviceAccount:PROJECT_ID@appspot.gserviceaccount.com \
+  --role=roles/storage.objectAdmin
+
+# Cloud Tasks queue is not created by app deploy. Name and region match gae/env.yaml.
+gcloud services enable cloudtasks.googleapis.com
+gcloud tasks queues create bot-tasks --location=us-central1
+
+gcloud app deploy gae/app.yaml gae/cron.yaml
+```
+
+`gcloud app deploy` does not upload the parquet files, and nightly cron only appends deltas. Once `GCS_BUCKET` is set, upload the local baselines from this machine:
+
+```bash
+uv run python cli.py upload-questions   # data/gotquestions_questions.parquet
+uv run python cli.py upload-rating      # data/dataset.parquet
+```
+
+`gae/requirements.txt` is generated. After changing `gae/pyproject.toml`:
+
+```bash
+cd gae
+uv lock
+uv export --no-dev --no-hashes --no-emit-project -o requirements.txt
+```
+
+`/questions`, `/rating`, and `/data` in the management bot report the cursors. The bot, training, and `run-api` stay as before: PyTorch does not run on F1.
 
 ---
 

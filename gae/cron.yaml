@@ -1,0 +1,14 @@
+cron:
+- description: "management bot heartbeat"
+  url: /cron/tick
+  schedule: every 1 hours
+
+- description: "nightly incremental question sync"
+  url: /cron/questions
+  schedule: every day 03:30
+  timezone: Europe/Berlin
+
+- description: "nightly incremental rating sync"
+  url: /cron/rating
+  schedule: every day 04:00
+  timezone: Europe/Berlin

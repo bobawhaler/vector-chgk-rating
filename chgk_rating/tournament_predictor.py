@@ -186,10 +186,22 @@ class TournamentPredictor:
                 return
             con = sqlite3.connect(self.db_path)
             cur = con.cursor()
-            cur.execute(
-                "INSERT OR REPLACE INTO api_cache (url, response_json, cached_at) VALUES (?, ?, datetime('now'))",
-                (url, response_text),
-            )
+            columns = {col[1] for col in cur.execute("PRAGMA table_info(api_cache)").fetchall()}
+            if "status_code" in columns:
+                cur.execute(
+                    "INSERT OR REPLACE INTO api_cache (url, status_code, response_json, created_at) VALUES (?, 200, ?, datetime('now'))",
+                    (url, response_text),
+                )
+            elif "cached_at" in columns:
+                cur.execute(
+                    "INSERT OR REPLACE INTO api_cache (url, response_json, cached_at) VALUES (?, ?, datetime('now'))",
+                    (url, response_text),
+                )
+            else:
+                cur.execute(
+                    "INSERT OR REPLACE INTO api_cache (url, response_json) VALUES (?, ?)",
+                    (url, response_text),
+                )
             con.commit()
             con.close()
         except Exception as exc:
@@ -467,6 +479,16 @@ class TournamentPredictor:
 
         if not teams_eval:
             raise ValueError(f"No valid team rosters found for tournament {tournament_id}")
+
+        # Check if actual scores are meaningful (tournament has actually been played)
+        has_real_scores = any(
+            t["actual_score"] is not None and t["actual_score"] > 0 for t in teams_eval
+        )
+        if not has_real_scores:
+            for t in teams_eval:
+                t["actual_score"] = None
+                t["diff_calibrated_dl"] = None
+                t["diff_true_dl"] = None
 
         # Monte Carlo Placement Simulation
         np.random.seed(42)

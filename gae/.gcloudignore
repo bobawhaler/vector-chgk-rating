@@ -1,0 +1,17 @@
+.gcloudignore
+.git
+.gitignore
+.DS_Store
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+env.yaml
+env_template.yaml
+cron.yaml
+artifact_registry_policy.json
+uv.lock
+.python-version
+pyproject.toml
