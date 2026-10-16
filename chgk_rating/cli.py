@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sys
 from pathlib import Path
@@ -26,6 +27,7 @@ from chgk_rating.config import (
     DEFAULT_META_PATH,
     DEFAULT_MODEL_PATH,
     DEFAULT_PARQUET_PATH,
+    DEFAULT_RATING_CREDITS_PATH,
     FORMAT_OFFLINE,
     FORMAT_ONLINE,
     FORMAT_SYNC,
@@ -570,6 +572,97 @@ def upload_rating_cmd(path: str) -> None:
     click.echo(_gae("rating_sync").upload_snapshot(Path(path)))
 
 
+@cli.command("backfill-credits")
+@click.option("--path", default=str(DEFAULT_PARQUET_PATH), help="Local rating parquet whose tournaments to reload")
+@click.option("--dest", default=str(DEFAULT_RATING_CREDITS_PATH), help="Where to write the local tour-editor table")
+@click.option("--upload/--no-upload", default=True, help="Upload the table to Cloud Storage")
+def backfill_credits_cmd(path: str, dest: str, upload: bool) -> None:
+    """Fetch tour editors for every tournament already in the local rating table."""
+    import httpx
+
+    from chgk_rating.tour_editors import credit_record
+
+    ids = sorted(int(item) for item in pd.read_parquet(path, columns=["tournament_id"])["tournament_id"].unique())
+    records: list[dict] = []
+    have: set[int] = set()
+    dest_path = Path(dest)
+    if dest_path.exists():
+        previous = pd.read_parquet(dest_path)
+        for row in previous.itertuples(index=False):
+            blocks = row.blocks
+            if isinstance(blocks, str):
+                blocks = json.loads(blocks)
+            package = row.package_editor_ids
+            if hasattr(package, "tolist"):
+                package = package.tolist()
+            tournament_id = int(row.tournament_id)
+            have.add(tournament_id)
+            records.append({
+                "tournament_id": tournament_id,
+                "package_editor_ids": [int(item) for item in (package or [])],
+                "blocks": list(blocks or []),
+            })
+    pending = [tournament_id for tournament_id in ids if tournament_id not in have]
+    click.echo(f"Fetching tour editors for {len(pending)} tournaments, {len(have)} already saved")
+    failed: list[int] = []
+    done = {"n": 0}
+
+    async def fetch_all() -> None:
+        limits = httpx.Limits(max_connections=2)
+        timeout = httpx.Timeout(30.0)
+        headers = {"Accept": "application/json", "User-Agent": "ChGKRating/1.0"}
+        semaphore = asyncio.Semaphore(2)
+
+        async def one(client: httpx.AsyncClient, tournament_id: int) -> None:
+            async with semaphore:
+                url = f"https://api.rating.chgk.info/tournaments/{tournament_id}"
+                card = None
+                for attempt in range(6):
+                    try:
+                        response = await client.get(url)
+                    except Exception:
+                        await asyncio.sleep(min(30, 2 ** attempt))
+                        continue
+                    if response.status_code == 429:
+                        retry_after = response.headers.get("Retry-After")
+                        wait = float(retry_after) if retry_after else min(30, 2 ** attempt)
+                        await asyncio.sleep(wait)
+                        continue
+                    if response.status_code >= 500:
+                        await asyncio.sleep(min(30, 2 ** attempt))
+                        continue
+                    if response.status_code == 404:
+                        return
+                    response.raise_for_status()
+                    card = response.json()
+                    break
+                await asyncio.sleep(0.2)
+                if isinstance(card, list):
+                    card = card[0] if card else None
+                if not isinstance(card, dict):
+                    failed.append(tournament_id)
+                    return
+                record = credit_record(card)
+                if record:
+                    records.append(record)
+                done["n"] += 1
+                if done["n"] % 200 == 0 or done["n"] == len(pending):
+                    click.echo(f"{done['n']}/{len(pending)}")
+
+        async with httpx.AsyncClient(limits=limits, timeout=timeout, headers=headers) as client:
+            await asyncio.gather(*(one(client, tournament_id) for tournament_id in pending))
+
+    if pending:
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        asyncio.run(fetch_all())
+    records.sort(key=lambda row: int(row["tournament_id"]))
+    click.echo(_gae("rating_sync").write_credits_table(records, Path(dest)))
+    if failed:
+        click.echo(f"Не удалось прочитать {len(failed)} турниров", err=True)
+    if upload:
+        click.echo(_gae("rating_sync").upload_credits(records))
+
+
 @cli.command("sync-rating")
 def sync_rating_cmd() -> None:
     """Run one incremental rating.chgk.info sync against Cloud Storage."""
@@ -590,7 +683,9 @@ def materialize_rating_cmd(path: str) -> None:
 def materialize_data_cmd() -> None:
     """Refresh local question and rating parquets from Cloud Storage."""
     click.echo(_gae("questions_sync").materialize(DEFAULT_GQ_QUESTIONS_PARQUET))
-    click.echo(_gae("rating_sync").materialize(DEFAULT_PARQUET_PATH))
+    rating = _gae("rating_sync")
+    click.echo(rating.materialize(DEFAULT_PARQUET_PATH))
+    click.echo(rating.materialize_credits(DEFAULT_RATING_CREDITS_PATH))
 
 
 @cli.command("link-questions")

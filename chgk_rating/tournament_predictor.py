@@ -287,9 +287,29 @@ class TournamentPredictor:
             mapped_eds.append(0)
         ed_tensor_pooled = torch.tensor([mapped_eds[:6]], dtype=torch.long, device=self.device)
 
-        # Per-tour editor tensors for tactical evaluation
+        # Per-tour editor tensors. Credits name the editors of each question range;
+        # without them, each listed tournament editor is treated as one tour.
         editor_tensors_by_tour = []
-        if tactical and editor_ids:
+        credit = None
+        if t_meta.get("credits"):
+            from chgk_rating.tour_editors import credit_record
+
+            credit = credit_record(t_meta)
+        if tactical and credit is not None and tour_questions:
+            from chgk_rating.tour_editors import editors_for_span
+
+            cursor = 1
+            for count in tour_questions:
+                span_ids = editors_for_span(credit, cursor, cursor + int(count) - 1, editor_ids)
+                mapped_tour = [ed_indexer.get_idx(str(item), default=0) for item in span_ids]
+                mapped_tour = [idx for idx in mapped_tour if idx > 0][:6]
+                while len(mapped_tour) < 6:
+                    mapped_tour.append(0)
+                editor_tensors_by_tour.append(
+                    torch.tensor([mapped_tour], dtype=torch.long, device=self.device)
+                )
+                cursor += int(count)
+        elif tactical and editor_ids:
             for ed_id in editor_ids:
                 e_idx = ed_indexer.get_idx(str(ed_id), default=0)
                 e_ten = torch.tensor([[e_idx, 0, 0, 0, 0, 0]], dtype=torch.long, device=self.device)

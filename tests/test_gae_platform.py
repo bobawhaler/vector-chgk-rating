@@ -170,6 +170,7 @@ def test_flask_routes() -> None:
     assert "/cron/tick" in paths
     assert "/cron/questions" in paths
     assert "/cron/rating" in paths
+    assert "/rating-continuetesttoken" in paths
     assert "/commandtesttoken" in paths
     assert "/process_tasktesttoken" in paths
 

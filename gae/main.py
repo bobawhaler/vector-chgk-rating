@@ -9,7 +9,7 @@ from flask import Flask, request
 
 import questions_sync
 import rating_sync
-from gae_platform import config, handlers, telegram_api
+from gae_platform import config, handlers, tasks, telegram_api
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -83,9 +83,41 @@ def cron_questions():
     return _cron_call(questions_sync.run_incremental, "Синхронизация вопросов упала. Подробности в логах.")
 
 
+def _notify(message: str) -> None:
+    for admin_id in sorted(config.admin_ids()):
+        telegram_api.send_message(admin_id, message)
+
+
+def _rating_batch(chain: int):
+    try:
+        result = rating_sync.run_incremental()
+    except Exception:
+        logging.getLogger(__name__).exception("nightly rating sync failed")
+        message = "Синхронизация рейтинга упала. Подробности в логах."
+        _notify(message)
+        return message, 200
+    if result.partial and chain + 1 < rating_sync.max_batches() and tasks.enqueue_rating_continue(chain + 1):
+        return result.message, 200
+    if result.partial or result.notify:
+        _notify(result.message)
+    return result.message, 200
+
+
 @app.get("/cron/rating")
 def cron_rating():
-    return _cron_call(rating_sync.run_incremental, "Синхронизация рейтинга упала. Подробности в логах.")
+    if not handlers.cron_authorized(request.headers):
+        return "forbidden", 403
+    return _rating_batch(0)
+
+
+@app.post(config.rating_continue_path())
+def rating_continue():
+    body = request.get_json(silent=True) or {}
+    try:
+        chain = int(body.get("chain") or 0)
+    except (TypeError, ValueError):
+        chain = 0
+    return _rating_batch(chain)
 
 
 if __name__ == "__main__":

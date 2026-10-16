@@ -194,7 +194,8 @@ The question corpus (~522 000 rows, 171 MB) and the tournament-result table (`da
 | `questions/snapshot.parquet` | gotquestions texts, answers, authors | uploaded once |
 | `questions/parts/*.jsonl.gz` | packs whose text changed | 03:30 Europe/Berlin |
 | `rating/snapshot.parquet` | team×question results from rating.chgk.info | uploaded once |
-| `rating/parts/*.jsonl.gz` | tournaments edited in the last 3 days | 04:00 Europe/Berlin |
+| `rating/parts/*.jsonl.gz` | tournaments edited in the last 3 days, including older tournaments whose result was corrected | 04:00 Europe/Berlin, then Cloud Tasks until that edit list is done |
+| `rating/credits.jsonl.gz` | tour editors from the tournament card (`credits`) | uploaded once, then updated with each rating batch |
 | `state/*.json` | cursors | rewritten in place |
 
 A part replaces rows for the tournaments it names. Question rows and rating rows share `question_id` (`{tournament_id}_{n}`).

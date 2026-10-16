@@ -22,6 +22,7 @@ from typing import Any, Callable
 
 from gae_platform import config
 from questions_sync import Storage, open_storage
+from tour_editors import credit_record
 
 logger = logging.getLogger(__name__)
 
@@ -29,9 +30,14 @@ API = "https://api.rating.chgk.info"
 SNAPSHOT_OBJECT = "rating/snapshot.parquet"
 STATE_OBJECT = "state/rating.json"
 PARTS_PREFIX = "rating/parts/"
+CREDITS_SNAPSHOT = "rating/credits.jsonl.gz"
+CREDITS_PARTS_PREFIX = "rating/credits-parts/"
 
 DEFAULT_LOOKBACK_DAYS = 3
+# One request stays under the 180s gunicorn timeout. The rating API does not
+# quota this client, so a partial pass enqueues the next batch the same night.
 DEFAULT_MAX_TOURNAMENTS = 40
+DEFAULT_MAX_BATCHES = 30
 
 ONLINE_KEYWORDS = (
     "онлайн",
@@ -57,6 +63,7 @@ class SyncResult:
     written: int
     fetched: int
     message: str
+    partial: bool = False
 
 
 def _today(now: datetime | None) -> date:
@@ -199,6 +206,13 @@ def _live_list(since: str, page: int) -> list[dict[str, Any]]:
     return found, len(raw_items) >= 50
 
 
+def _live_tournament(tournament_id: int) -> dict[str, Any] | None:
+    data = _live_get(f"{API}/tournaments/{tournament_id}")
+    if isinstance(data, list):
+        return data[0] if data else None
+    return data if isinstance(data, dict) else None
+
+
 def _live_results(tournament_id: int) -> list[dict[str, Any]]:
     data = _live_get(
         f"{API}/tournaments/{tournament_id}/results",
@@ -220,7 +234,11 @@ def save_state(storage: Storage, state: dict[str, Any]) -> None:
 
 
 def _write_part(storage: Storage, rows: list[dict[str, Any]], moment: datetime) -> str:
-    name = PARTS_PREFIX + moment.strftime("%Y%m%dT%H%M%SZ") + ".jsonl.gz"
+    return _write_part_named(storage, rows, moment, PARTS_PREFIX)
+
+
+def _write_part_named(storage: Storage, rows: list[dict[str, Any]], moment: datetime, prefix: str) -> str:
+    name = prefix + moment.strftime("%Y%m%dT%H%M%SZ") + ".jsonl.gz"
     buffer = io.BytesIO()
     with gzip.GzipFile(fileobj=buffer, mode="wb") as handle:
         for row in rows:
@@ -228,6 +246,10 @@ def _write_part(storage: Storage, rows: list[dict[str, Any]], moment: datetime) 
             handle.write(b"\n")
     storage.put_bytes(name, buffer.getvalue(), "application/gzip")
     return name
+
+
+def max_batches() -> int:
+    return int(os.environ.get("RATING_MAX_BATCHES") or DEFAULT_MAX_BATCHES)
 
 
 def _settings(lookback: int | None, max_tournaments: int | None) -> tuple[int, int]:
@@ -243,6 +265,7 @@ def run_incremental(
     storage: Storage | None = None,
     list_tournaments: Callable[[str, int], list[dict[str, Any]]] | None = None,
     fetch_results: Callable[[int], list[dict[str, Any]]] | None = None,
+    fetch_tournament: Callable[[int], dict[str, Any] | None] | None = None,
     sleep: Callable[[float], None] | None = None,
     lookback: int | None = None,
     max_tournaments: int | None = None,
@@ -265,6 +288,11 @@ def run_incremental(
 
     listing = list_tournaments or _live_list  # type: ignore[assignment]
     results_of = fetch_results or _live_results
+    # Tests pass fetch_results and must not call the rating site for the card.
+    if fetch_tournament is None and fetch_results is not None:
+        cards: Callable[[int], dict[str, Any] | None] = lambda _tournament_id: None
+    else:
+        cards = fetch_tournament or _live_tournament
     pause = sleep or __import__("time").sleep
     interval = float(os.environ.get("RATING_INTERVAL_SECONDS") or "0.2")
     moment = now or datetime.now(timezone.utc)
@@ -278,6 +306,7 @@ def run_incremental(
         done = set()
 
     rows: list[dict[str, Any]] = []
+    credits: list[dict[str, Any]] = []
     replaced: list[int] = []
     fetched = 0
     hit_cap = False
@@ -307,6 +336,13 @@ def run_incremental(
                     pause(interval)
                 results = results_of(tournament_id)
                 fetched += 1
+                if fetched and interval > 0:
+                    pause(interval)
+                card = cards(tournament_id)
+                fetched += 1
+                record = credit_record(card) if card else None
+                if record:
+                    credits.append(record)
                 produced = records_from_results(tournament, results)
                 if not produced:
                     logger.warning("Tournament %s produced no rows", tournament_id)
@@ -320,7 +356,10 @@ def run_incremental(
         status = "partial" if hit_cap else "ok"
     except RatingBusy as exc:
         logger.warning("Rating sync stopped: %s", exc)
-        _persist(storage, state, rows, replaced, done, since, today, fetched, "busy", moment, hit_cap=True)
+        _persist(
+            storage, state, rows, replaced, done, since, today, fetched, "busy", moment,
+            hit_cap=True, credits=credits,
+        )
         return SyncResult(
             False,
             True,
@@ -329,14 +368,25 @@ def run_incremental(
             f"Синхронизация рейтинга остановлена: {exc}. Турниров записано: {len(replaced)}.",
         )
 
-    _persist(storage, state, rows, replaced, done, since, today, fetched, status, moment, hit_cap=hit_cap)
-    message = (
-        f"Рейтинг: с {since}, запросов {fetched}, турниров {len(replaced)}"
-        + (", есть продолжение" if hit_cap else "")
-        + "."
+    resumed = bool(state.get("pass_since"))
+    _persist(
+        storage, state, rows, replaced, done, since, today, fetched, status, moment,
+        hit_cap=hit_cap, credits=credits,
     )
+    if hit_cap:
+        message = (
+            f"Рейтинг: правки после {since}. "
+            f"В этом заходе {len(replaced)} турниров, запросов {fetched}. Есть продолжение."
+        )
+    else:
+        message = (
+            f"Рейтинг дочитан: правки после {since}, "
+            f"в проходе {len(done)} турниров, запросов {fetched}."
+        )
     logger.info(message)
-    return SyncResult(True, bool(replaced) or hit_cap, len(replaced), fetched, message)
+    # A backlog that just closed should be reported even when the last batch wrote nothing.
+    notify = bool(replaced) or (resumed and not hit_cap)
+    return SyncResult(True, notify, len(replaced), fetched, message, partial=hit_cap)
 
 
 def _persist(
@@ -352,17 +402,26 @@ def _persist(
     moment: datetime,
     *,
     hit_cap: bool,
+    credits: list[dict[str, Any]] | None = None,
 ) -> None:
     part = _write_part(storage, rows, moment) if rows else ""
     parts = list(state.get("parts") or [])
     if replaced:
         parts.append({"name": part, "tournament_ids": replaced})
+    credit_parts = list(state.get("credit_parts") or [])
+    if credits:
+        credit_name = _write_part_named(storage, credits, moment, CREDITS_PARTS_PREFIX)
+        credit_parts.append({
+            "name": credit_name,
+            "tournament_ids": [int(item["tournament_id"]) for item in credits],
+        })
     state.update({
         "updated_at": _stamp(moment),
         "last_status": status,
         "last_fetched": fetched,
         "last_written": len(replaced),
         "parts": parts,
+        "credit_parts": credit_parts,
         "snapshot": SNAPSHOT_OBJECT,
     })
     if hit_cap:
@@ -461,6 +520,67 @@ def materialize(dest: Path, *, storage: Storage | None = None) -> str:
     return f"Собрано {len(frame)} строк рейтинга, {frame['tournament_id'].nunique()} турниров в {dest}"
 
 
+def _credit_lines(storage: Storage) -> list[dict[str, Any]]:
+    state = load_state(storage) or {}
+    by_id: dict[int, dict[str, Any]] = {}
+    raw = storage.get_bytes(CREDITS_SNAPSHOT)
+    if raw:
+        for row in _read_part(raw):
+            by_id[int(row["tournament_id"])] = row
+    for part in state.get("credit_parts") or []:
+        payload = storage.get_bytes(part.get("name") or "")
+        if not payload:
+            continue
+        for row in _read_part(payload):
+            by_id[int(row["tournament_id"])] = row
+    return [by_id[key] for key in sorted(by_id)]
+
+
+def upload_credits(records: list[dict[str, Any]], *, storage: Storage | None = None) -> str:
+    """Replace the credits snapshot. Nightly parts written after this stay authoritative."""
+    if storage is None:
+        storage = open_storage()
+    for name in storage.list_prefix(CREDITS_PARTS_PREFIX):
+        storage.delete(name)
+    buffer = io.BytesIO()
+    with gzip.GzipFile(fileobj=buffer, mode="wb") as handle:
+        for row in records:
+            handle.write(json.dumps(row, ensure_ascii=False).encode())
+            handle.write(b"\n")
+    storage.put_bytes(CREDITS_SNAPSHOT, buffer.getvalue(), "application/gzip")
+    state = load_state(storage) or {}
+    state["credit_parts"] = []
+    state["credits_tournaments"] = len(records)
+    state["credits_updated_at"] = _stamp()
+    save_state(storage, state)
+    return f"Загружены редакторы туров для {len(records)} турниров в gs://{config.gcs_bucket()}/{CREDITS_SNAPSHOT}"
+
+
+def write_credits_table(records: list[dict[str, Any]], dest: Path) -> str:
+    import pandas as pd
+
+    frame = pd.DataFrame([
+        {
+            "tournament_id": int(row["tournament_id"]),
+            "package_editor_ids": row.get("package_editor_ids") or [],
+            "blocks": json.dumps(row.get("blocks") or [], ensure_ascii=False),
+        }
+        for row in records
+    ])
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_parquet(dest, index=False)
+    return f"Записаны редакторы туров для {len(frame)} турниров в {dest}"
+
+
+def materialize_credits(dest: Path, *, storage: Storage | None = None) -> str:
+    if storage is None:
+        storage = open_storage()
+    rows = _credit_lines(storage)
+    if not rows:
+        return "Редакторы туров ещё не загружены."
+    return write_credits_table(rows, dest)
+
+
 def status_text(storage: Storage | None = None) -> str:
     bucket = config.gcs_bucket()
     if storage is None:
@@ -482,6 +602,7 @@ def status_text(storage: Storage | None = None) -> str:
         f"последний прогон: {state.get('last_status') or '-'} "
         f"(запросов {state.get('last_fetched', 0)}, турниров {state.get('last_written', 0)})",
         "незаконченный проход: " + (state.get("pass_since") or "нет"),
+        f"редакторы туров: {state.get('credits_tournaments', 0)} турниров",
     ])
 
 

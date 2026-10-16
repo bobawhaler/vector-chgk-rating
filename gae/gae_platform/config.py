@@ -133,6 +133,10 @@ def process_task_path() -> str:
     return f"/process_task{obfuscation_token()}"
 
 
+def rating_continue_path() -> str:
+    return f"/rating-continue{obfuscation_token()}"
+
+
 def webhook_url() -> str:
     project = project_id()
     if not project or not obfuscation_token():

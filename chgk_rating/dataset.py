@@ -12,7 +12,37 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from chgk_rating.config import DEFAULT_META_PATH, FORMAT_OFFLINE, FORMAT_TO_ID
+from chgk_rating.config import DEFAULT_META_PATH, DEFAULT_RATING_CREDITS_PATH, FORMAT_OFFLINE, FORMAT_TO_ID
+
+
+def _question_number(question_id: Any) -> Optional[int]:
+    _head, sep, tail = str(question_id).rpartition("_")
+    if not sep:
+        return None
+    try:
+        return int(tail)
+    except ValueError:
+        return None
+
+
+def _load_question_editors(path: Path = DEFAULT_RATING_CREDITS_PATH) -> Dict[int, dict]:
+    if not path.exists():
+        return {}
+    frame = pd.read_parquet(path)
+    loaded: Dict[int, dict] = {}
+    for row in frame.itertuples(index=False):
+        blocks = row.blocks
+        if isinstance(blocks, str):
+            blocks = json.loads(blocks)
+        package = row.package_editor_ids
+        if hasattr(package, "tolist"):
+            package = package.tolist()
+        loaded[int(row.tournament_id)] = {
+            "tournament_id": int(row.tournament_id),
+            "package_editor_ids": [int(item) for item in (package or [])],
+            "blocks": list(blocks or []),
+        }
+    return loaded
 
 
 def parse_date(d_str: Any) -> datetime:
@@ -142,6 +172,7 @@ class ChGKDataset(Dataset):
         max_players_per_team: int = 6,
         max_editors_per_tourn: int = 6,
         tournament_editors_map: Optional[Dict[int, List[int]]] = None,
+        question_editors: Optional[Dict[int, dict]] = None,
         track_running_state: bool = True,
     ) -> None:
         self.max_players = max_players_per_team
@@ -163,6 +194,9 @@ class ChGKDataset(Dataset):
                 tid: meta["editor_ids"]
                 for tid, meta in reg._tournament_metadata.items()
             }
+        if question_editors is None:
+            question_editors = _load_question_editors()
+        from chgk_rating.tour_editors import editors_for_question
         tournament_dl_map = {
             tid: float(meta.get("intrinsic_true_dl") or meta.get("true_dl") or meta.get("forecast_dl") or 4.25)
             for tid, meta in reg._tournament_metadata.items()
@@ -220,7 +254,7 @@ class ChGKDataset(Dataset):
         cached_pair_mat: Optional[List[List[float]]] = None
         cached_exp_mat: Optional[List[List[float]]] = None
 
-        cached_tid = None
+        cached_editor_key = None
         cached_mapped_eds: Optional[List[int]] = None
 
         for t_id_val, q_id_raw, fmt_str, solved_val, curr_date_str, raw_players in zip(
@@ -229,11 +263,18 @@ class ChGKDataset(Dataset):
             q_idx = q_idxer.get_idx(q_id_raw, default=0)
             fmt_id = fmt_map.get(fmt_str, 0)
 
-            # Map tournament editors
-            if t_id_val == cached_tid and cached_mapped_eds is not None:
+            # Tour editors from the rating card when that tournament was loaded.
+            question_number = _question_number(q_id_raw)
+            editor_key = (int(t_id_val), question_number)
+            if editor_key == cached_editor_key and cached_mapped_eds is not None:
                 mapped_eds = cached_mapped_eds
             else:
-                raw_eds = tournament_editors_map.get(int(t_id_val), [])
+                record = question_editors.get(int(t_id_val))
+                package_ids = tournament_editors_map.get(int(t_id_val), [])
+                if record is not None and question_number is not None:
+                    raw_eds = editors_for_question(record, question_number, package_ids)
+                else:
+                    raw_eds = package_ids
                 mapped_eds = []
                 for e in raw_eds[:max_editors_per_tourn]:
                     e_idx = ed_idxer.get_idx(str(e), default=0)
@@ -241,7 +282,7 @@ class ChGKDataset(Dataset):
                         mapped_eds.append(e_idx)
                 while len(mapped_eds) < max_editors_per_tourn:
                     mapped_eds.append(0)
-                cached_tid = t_id_val
+                cached_editor_key = editor_key
                 cached_mapped_eds = mapped_eds
 
             # Check if team roster and date are identical to previous question

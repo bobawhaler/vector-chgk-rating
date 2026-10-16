@@ -30,6 +30,7 @@ NUM_FORMATS: Final[int] = len(FORMAT_TO_ID)
 DEFAULT_API_BASE_URL: Final[str] = "https://api.rating.chgk.info"
 DEFAULT_CACHE_DB_PATH: Final[Path] = DATA_DIR / "chgk_cache.db"
 DEFAULT_PARQUET_PATH: Final[Path] = DATA_DIR / "dataset.parquet"
+DEFAULT_RATING_CREDITS_PATH: Final[Path] = DATA_DIR / "rating_credits.parquet"
 DEFAULT_MODEL_PATH: Final[Path] = MODELS_DIR / "best_model.pt"
 DEFAULT_META_PATH: Final[Path] = MODELS_DIR / "metadata.json"
 

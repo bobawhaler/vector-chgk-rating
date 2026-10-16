@@ -14,6 +14,8 @@ _GAE = Path(__file__).resolve().parents[1] / "gae"
 if str(_GAE) not in sys.path:
     sys.path.append(str(_GAE))
 
+from datetime import datetime, timezone
+
 from questions_sync import MemoryStorage
 from rating_sync import materialize, records_from_results, run_incremental, upload_snapshot
 
@@ -116,6 +118,7 @@ def test_cap_resumes_on_the_next_run(tmp_path: Path) -> None:
         max_tournaments=1,
     )
     assert first.written == 1
+    assert first.partial
     assert "продолжение" in first.message
 
     second = run_incremental(
@@ -130,6 +133,65 @@ def test_cap_resumes_on_the_next_run(tmp_path: Path) -> None:
     state_raw = storage.get_bytes("state/rating.json")
     assert state_raw is not None
     assert b'"pass_since": ""' in state_raw or b'"pass_since":""' in state_raw
+
+
+def test_window_follows_edit_date_not_tournament_date(tmp_path: Path) -> None:
+    storage = MemoryStorage()
+    _upload(tmp_path, storage)
+    seen: dict[str, str] = {}
+
+    def listing(since: str, page: int) -> list[dict]:
+        seen["since"] = since
+        return []
+
+    result = run_incremental(
+        storage=storage,
+        list_tournaments=listing,
+        fetch_results=lambda tournament_id: [],
+        sleep=lambda _seconds: None,
+        lookback=3,
+        now=datetime(2026, 10, 16, 2, 0, tzinfo=timezone.utc),
+    )
+    assert result.ok
+    assert not result.partial
+    assert seen["since"] == "2026-10-13"
+
+
+def test_sync_stores_tour_editors(tmp_path: Path) -> None:
+    storage = MemoryStorage()
+    _upload(tmp_path, storage)
+
+    def card(tournament_id: int) -> dict:
+        return {
+            "id": tournament_id,
+            "editors": [{"id": 4}],
+            "credits": [{
+                "tour": 1,
+                "questions": [1, 2],
+                "editors": [{"player": {"id": 3671}}],
+            }],
+        }
+
+    result = run_incremental(
+        storage=storage,
+        list_tournaments=lambda since, page: [_tournament(10)],
+        fetch_results=lambda tournament_id: [_result("11")],
+        fetch_tournament=card,
+        sleep=lambda _seconds: None,
+        max_tournaments=5,
+    )
+    assert result.ok
+    saved = storage.get_bytes("state/rating.json")
+    assert saved is not None
+    assert b"credit_parts" in saved
+    import gzip
+
+    payload = b"".join(
+        storage.get_bytes(name) or b""
+        for name in storage.objects
+        if name.startswith("rating/credits-parts/")
+    )
+    assert b"3671" in gzip.decompress(payload)
 
 
 def test_missing_upload_is_reported() -> None:
