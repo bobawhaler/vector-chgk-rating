@@ -144,6 +144,14 @@ def test_set_webhook_does_not_echo_the_url(monkeypatch) -> None:
     assert "testtoken" not in body
 
 
+def test_rating_continuation_delay() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime(2026, 10, 24, 2, 0, tzinfo=timezone.utc)
+    assert tasks.continuation_when(45, now) == now + timedelta(seconds=45)
+    assert tasks.continuation_when(-5, now) == now
+
+
 def test_on_cron_returns_nothing_or_text() -> None:
     import project_commands
 

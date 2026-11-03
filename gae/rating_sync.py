@@ -17,8 +17,9 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from gae_platform import config
 from questions_sync import Storage, open_storage
@@ -34,10 +35,17 @@ CREDITS_SNAPSHOT = "rating/credits.jsonl.gz"
 CREDITS_PARTS_PREFIX = "rating/credits-parts/"
 
 DEFAULT_LOOKBACK_DAYS = 3
-# One request stays under the 180s gunicorn timeout. The rating API does not
-# quota this client, so a partial pass enqueues the next batch the same night.
-DEFAULT_MAX_TOURNAMENTS = 40
+# One cron invocation has to finish inside the 180s gunicorn timeout. At one
+# request per second, twenty tournaments (results plus the card) stay inside
+# it. The next batch is a Cloud Task with its own delay, so the night does not
+# run back to back. A 429 from the rating site includes Retry-After for token
+# traffic; that delay is how long the following batch waits.
+DEFAULT_MAX_TOURNAMENTS = 20
 DEFAULT_MAX_BATCHES = 30
+DEFAULT_INTERVAL_SECONDS = 1.0
+DEFAULT_BATCH_DELAY_SECONDS = 30.0
+DEFAULT_RETRY_SECONDS = 60.0
+MAX_PAUSE_SECONDS = 6 * 60 * 60
 
 ONLINE_KEYWORDS = (
     "онлайн",
@@ -55,6 +63,10 @@ ONLINE_KEYWORDS = (
 class RatingBusy(Exception):
     """The rating API asked us to back off."""
 
+    def __init__(self, message: str, *, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
 
 @dataclass
 class SyncResult:
@@ -64,6 +76,7 @@ class SyncResult:
     fetched: int
     message: str
     partial: bool = False
+    retry_after: float | None = None
 
 
 def _today(now: datetime | None) -> date:
@@ -165,6 +178,36 @@ def records_from_results(tournament: dict[str, Any], results: list[dict[str, Any
     return rows
 
 
+def retry_after_seconds(headers: Mapping[str, str] | None, now: datetime | None = None) -> float | None:
+    """Seconds the server asked us to wait, from Retry-After (delta or HTTP date)."""
+    if not headers:
+        return None
+    raw = headers.get("Retry-After") or headers.get("X-RateLimit-Retry-After")
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        seconds = float(text)
+    except ValueError:
+        seconds = -1.0
+    if seconds >= 0:
+        return seconds
+    try:
+        when = parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    return max(0.0, (when - current).total_seconds())
+
+
+def bounded_pause(header_seconds: float | None) -> float:
+    """Wait the server asked for, or the default when the 429 carried no clock."""
+    chosen = retry_seconds() if header_seconds is None else header_seconds
+    return float(min(max(chosen, 1.0), MAX_PAUSE_SECONDS))
+
+
 def _live_get(url: str, params: dict | None = None) -> Any:
     import requests
 
@@ -177,7 +220,10 @@ def _live_get(url: str, params: dict | None = None) -> Any:
     if response.status_code == 404:
         return None
     if response.status_code in (429, 500, 502, 503, 504):
-        raise RatingBusy(f"HTTP {response.status_code} on {url}")
+        raise RatingBusy(
+            f"HTTP {response.status_code} on {url}",
+            retry_after=retry_after_seconds(response.headers),
+        )
     response.raise_for_status()
     return response.json()
 
@@ -252,6 +298,26 @@ def max_batches() -> int:
     return int(os.environ.get("RATING_MAX_BATCHES") or DEFAULT_MAX_BATCHES)
 
 
+def batch_delay_seconds() -> float:
+    return float(os.environ.get("RATING_BATCH_DELAY_SECONDS") or DEFAULT_BATCH_DELAY_SECONDS)
+
+
+def retry_seconds() -> float:
+    return float(os.environ.get("RATING_RETRY_SECONDS") or DEFAULT_RETRY_SECONDS)
+
+
+def _in_future(stamp: str, moment: datetime) -> bool:
+    if not stamp:
+        return False
+    try:
+        until = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=timezone.utc)
+    return until > moment
+
+
 def _settings(lookback: int | None, max_tournaments: int | None) -> tuple[int, int]:
     if lookback is None:
         lookback = int(os.environ.get("RATING_LOOKBACK_DAYS") or DEFAULT_LOOKBACK_DAYS)
@@ -270,6 +336,7 @@ def run_incremental(
     lookback: int | None = None,
     max_tournaments: int | None = None,
     now: datetime | None = None,
+    honor_backoff: bool = True,
 ) -> SyncResult:
     lookback, max_tournaments = _settings(lookback, max_tournaments)
     if storage is None:
@@ -294,9 +361,12 @@ def run_incremental(
     else:
         cards = fetch_tournament or _live_tournament
     pause = sleep or __import__("time").sleep
-    interval = float(os.environ.get("RATING_INTERVAL_SECONDS") or "0.2")
+    interval = float(os.environ.get("RATING_INTERVAL_SECONDS") or DEFAULT_INTERVAL_SECONDS)
     moment = now or datetime.now(timezone.utc)
     today = _today(moment)
+    if honor_backoff and _in_future(str(state.get("busy_until") or ""), moment):
+        until = str(state["busy_until"])
+        return SyncResult(True, False, 0, 0, f"Рейтинг на паузе до {until}.")
 
     if state.get("pass_since"):
         since = str(state["pass_since"])
@@ -355,17 +425,20 @@ def run_incremental(
             page += 1
         status = "partial" if hit_cap else "ok"
     except RatingBusy as exc:
-        logger.warning("Rating sync stopped: %s", exc)
+        wait = bounded_pause(exc.retry_after)
+        logger.warning("Rating sync paused for %.0fs: %s", wait, exc)
         _persist(
             storage, state, rows, replaced, done, since, today, fetched, "busy", moment,
-            hit_cap=True, credits=credits,
+            hit_cap=True, credits=credits, pause_until=moment + timedelta(seconds=wait),
         )
         return SyncResult(
             False,
             True,
             len(replaced),
             fetched,
-            f"Синхронизация рейтинга остановлена: {exc}. Турниров записано: {len(replaced)}.",
+            f"Сайт рейтинга ответил {exc}. Пауза {int(wait)} с, турниров записано: {len(replaced)}.",
+            partial=True,
+            retry_after=wait,
         )
 
     resumed = bool(state.get("pass_since"))
@@ -403,6 +476,7 @@ def _persist(
     *,
     hit_cap: bool,
     credits: list[dict[str, Any]] | None = None,
+    pause_until: datetime | None = None,
 ) -> None:
     part = _write_part(storage, rows, moment) if rows else ""
     parts = list(state.get("parts") or [])
@@ -423,6 +497,7 @@ def _persist(
         "parts": parts,
         "credit_parts": credit_parts,
         "snapshot": SNAPSHOT_OBJECT,
+        "busy_until": _stamp(pause_until) if pause_until is not None else "",
     })
     if hit_cap:
         state["pass_since"] = since
@@ -602,6 +677,7 @@ def status_text(storage: Storage | None = None) -> str:
         f"последний прогон: {state.get('last_status') or '-'} "
         f"(запросов {state.get('last_fetched', 0)}, турниров {state.get('last_written', 0)})",
         "незаконченный проход: " + (state.get("pass_since") or "нет"),
+        "пауза до: " + (state.get("busy_until") or "нет"),
         f"редакторы туров: {state.get('credits_tournaments', 0)} турниров",
     ])
 

@@ -14,10 +14,19 @@ _GAE = Path(__file__).resolve().parents[1] / "gae"
 if str(_GAE) not in sys.path:
     sys.path.append(str(_GAE))
 
-from datetime import datetime, timezone
+import json
+from datetime import datetime, timedelta, timezone
 
 from questions_sync import MemoryStorage
-from rating_sync import materialize, records_from_results, run_incremental, upload_snapshot
+from rating_sync import (
+    RatingBusy,
+    bounded_pause,
+    materialize,
+    records_from_results,
+    retry_after_seconds,
+    run_incremental,
+    upload_snapshot,
+)
 
 
 def _result(mask: str) -> dict:
@@ -192,6 +201,82 @@ def test_sync_stores_tour_editors(tmp_path: Path) -> None:
         if name.startswith("rating/credits-parts/")
     )
     assert b"3671" in gzip.decompress(payload)
+
+
+def test_retry_after_reads_seconds_and_http_date() -> None:
+    moment = datetime(2015, 10, 21, 7, 27, tzinfo=timezone.utc)
+    assert retry_after_seconds({"Retry-After": "45"}, moment) == 45
+    assert retry_after_seconds({"X-RateLimit-Retry-After": "12"}, moment) == 12
+    assert retry_after_seconds({"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"}, moment) == 60
+    assert retry_after_seconds({}, moment) is None
+    assert retry_after_seconds({"Retry-After": "soon"}, moment) is None
+    assert bounded_pause(None) == 60
+    assert bounded_pause(0) == 1
+    assert bounded_pause(45) == 45
+
+
+def test_busy_keeps_finished_tournaments_and_waits(tmp_path: Path) -> None:
+    storage = MemoryStorage()
+    _upload(tmp_path, storage)
+    moment = datetime(2026, 10, 24, 2, 0, tzinfo=timezone.utc)
+
+    def listing(since: str, page: int) -> list[dict]:
+        return [_tournament(10), _tournament(12)]
+
+    def results(tournament_id: int) -> list[dict]:
+        if tournament_id == 12:
+            raise RatingBusy(
+                "HTTP 429 on https://api.rating.chgk.info/tournaments/12/results",
+                retry_after=45,
+            )
+        return [_result("1")]
+
+    stopped = run_incremental(
+        storage=storage,
+        list_tournaments=listing,
+        fetch_results=results,
+        sleep=lambda _seconds: None,
+        max_tournaments=10,
+        now=moment,
+    )
+    assert stopped.partial
+    assert stopped.retry_after == 45
+    assert stopped.written == 1
+    state = json.loads(storage.get_bytes("state/rating.json") or b"{}")
+    assert state["done_ids"] == [10]
+    assert state["busy_until"] == "2026-10-24T02:00:45Z"
+    assert state["pass_since"]
+
+    calls = {"n": 0}
+
+    def blocked(since: str, page: int) -> list[dict]:
+        calls["n"] += 1
+        return []
+
+    paused = run_incremental(
+        storage=storage,
+        list_tournaments=blocked,
+        fetch_results=results,
+        sleep=lambda _seconds: None,
+        now=moment + timedelta(seconds=10),
+    )
+    assert paused.ok
+    assert calls["n"] == 0
+    assert "паузе" in paused.message
+
+    resumed = run_incremental(
+        storage=storage,
+        list_tournaments=listing,
+        fetch_results=lambda tournament_id: [_result("1")],
+        sleep=lambda _seconds: None,
+        max_tournaments=10,
+        now=moment + timedelta(seconds=10),
+        honor_backoff=False,
+    )
+    assert resumed.written == 1
+    state = json.loads(storage.get_bytes("state/rating.json") or b"{}")
+    assert state["done_ids"] == []
+    assert state["busy_until"] == ""
 
 
 def test_missing_upload_is_reported() -> None:

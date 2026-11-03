@@ -88,16 +88,18 @@ def _notify(message: str) -> None:
         telegram_api.send_message(admin_id, message)
 
 
-def _rating_batch(chain: int):
+def _rating_batch(chain: int, *, scheduled: bool = False):
     try:
-        result = rating_sync.run_incremental()
+        result = rating_sync.run_incremental(honor_backoff=not scheduled)
     except Exception:
         logging.getLogger(__name__).exception("nightly rating sync failed")
         message = "Синхронизация рейтинга упала. Подробности в логах."
         _notify(message)
         return message, 200
-    if result.partial and chain + 1 < rating_sync.max_batches() and tasks.enqueue_rating_continue(chain + 1):
-        return result.message, 200
+    if result.partial and chain + 1 < rating_sync.max_batches():
+        delay = result.retry_after if result.retry_after is not None else rating_sync.batch_delay_seconds()
+        if tasks.enqueue_rating_continue(chain + 1, delay):
+            return result.message, 200
     if result.partial or result.notify:
         _notify(result.message)
     return result.message, 200
@@ -117,7 +119,8 @@ def rating_continue():
         chain = int(body.get("chain") or 0)
     except (TypeError, ValueError):
         chain = 0
-    return _rating_batch(chain)
+    # A task we scheduled is the run that is allowed to talk to the site during a pause.
+    return _rating_batch(chain, scheduled=bool(body.get("scheduled")))
 
 
 if __name__ == "__main__":
