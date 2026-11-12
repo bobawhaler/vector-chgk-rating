@@ -47,7 +47,7 @@ The tournament website's raw `trueDL` metric is circular and format-polluted: be
 
 The system decouples intrinsic question difficulty from play environment:
 - **Synchronous / Offline Tournaments**: $DL_{\text{intrinsic}} = TrueDL_{\text{site}}$.
-- **Asynchronous Mirror Packages**: Paired with their synchronous twins so that $DL_{\text{intrinsic}} = TrueDL_{\text{sync\_twin}}$.
+- **Asynchronous Mirror Packages**: Paired with their synchronous twins so that $DL_{\text{intrinsic}} = TrueDL_{\text{sync twin}}$.
 - **Unpaired Online Asynchronous Packages**: $DL_{\text{intrinsic}} = TrueDL_{\text{site}} + 0.64$.
 - **Stage 1 Bayesian Editor Calibration**:
   $$\beta_e = \frac{\sum (DL_{\text{intrinsic}} - DL_{\text{forecast}}) + n_0 \mu_0}{n + n_0}$$
@@ -61,7 +61,7 @@ The higher solve rates of online tournaments are thus attributed strictly to the
 ### 1.3. Knowledge Pooling: Smooth-Max ($L_{\infty}$ Approximation)
 A team solves a question if **at least one** player possesses the required insight or factual knowledge. Pure linear averaging ($\frac{1}{n} \sum k_i$) penalizes teams for carrying specialists or support players, while hard maximum ($\max_i k_i$) suffers from zero gradients for non-maximum players and ignores team depth:
 $$K_{\text{team}, d} = k_{\max, d} + \tau \cdot \log \sum_{i=1}^{n} \exp\left(\frac{k_{i, d} - k_{\max, d}}{\tau}\right)$$
-- $\tau = \text{softplus}(\text{raw\_temp}) + 0.05$: learnable temperature parameter.
+- $\tau = \text{softplus}(\text{raw temp}) + 0.05$: learnable temperature parameter.
 - As $\tau \to 0$, Smooth-Max approaches exact hard maximum without penalizing incomplete rosters (1–5 players).
 
 ### 1.4. Bounded Synergy & Experience Saturation
@@ -70,7 +70,7 @@ $$S_{im}(t) = \left(c_i(F)^\top W_{\text{synergy}} c_m(F)\right) \cdot \left(1 +
 - **Communication Vectors**: $c_i(F) = c_{\text{base}, i} + e_F \odot c_{\delta, i} \in \mathbb{R}^M$ ($M = 3$ core team roles: captain/selector, generator, critic).
 - **Intensive Pairwise Average**: Total team synergy is scaled by available pairs:
   $$S_{\text{team}} = \frac{1}{\max(1, \binom{n}{2})} \sum_{i < m} S_{im}$$
-- **Bounded Synergy Weight**: $w_{\text{syn}} = 0.25 \cdot \sigma(\text{raw\_synergy\_weight}) \in [0, 0.25]$. Constrains chemistry to realistic human bounds ($\approx \pm 2.5$ questions on a 120-question package) so team chemistry can never overpower individual knowledge.
+- **Bounded Synergy Weight**: $w_{\text{syn}} = 0.25 \cdot \sigma(\text{raw synergy weight}) \in [0, 0.25]$. Constrains chemistry to realistic human bounds ($\approx \pm 2.5$ questions on a 120-question package) so team chemistry can never overpower individual knowledge.
 - **Experience Saturation**: $\tanh(\log(1 + N_{im}))$ models rapid initial familiarity over the first 2–3 games ($\approx 80\%$ of potential synergy) with a hard mathematical ceiling for veteran pairs.
 - **Decay Half-Life**: Elapsed time since the pair's last joint game decays synergy with a learned half-life ($\approx 845$ days).
 
