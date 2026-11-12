@@ -36,50 +36,50 @@ The rating system models ChGK as a collaborative team game with asymmetric knowl
 
 ### 1.1. Multidimensional IRT and Knowledge Space
 Standard 1D Rasch or Elo models treat an entire team as a single scalar skill $\theta$. This system extends Multidimensional Item Response Theory (MIRT) to model individual players and tournament packages in latent factor space:
-- **Player Base Knowledge Vector**: $k_i \in \mathbb{R}^D$ ($D = 6$: 1 general cognitive/analytical ability dimension + 5 macro-topic dimensions). Dimensionality reduction via SVD demonstrates that $D=6$ captures $82\%$ of variance while completely eliminating noise and overfitting on high-frequency synchronous players.
+- **Player Base Knowledge Vector**: $k\_i \in \mathbb{R}^D$ ($D = 6$: 1 general cognitive/analytical ability dimension + 5 macro-topic dimensions). Dimensionality reduction via SVD demonstrates that $D=6$ captures $82\%$ of variance while completely eliminating noise and overfitting on high-frequency synchronous players.
 - **Online Divergence Component**: In remote online play (Discord/Zoom/asynchronous platforms), player performance can deviate due to search tools or unproctored taking:
-  $$k_{i, \text{online}} = k_{i, \text{base}} + \Delta k_{i, \text{online}}$$
-  where $\Delta k_{i, \text{online}}$ is subject to a $10\times$ $L_2$ Bayesian shrinkage penalty pulling toward zero. Only players with statistically significant and persistent divergence across multiple tournaments develop non-zero online delta vectors.
-- **Editor / Package Vector**: $e_{\text{pkg}} \in \mathbb{R}^D$ ($D = 6$), pooling topic requirements and stylistic characteristics of the package editors.
+  $$k\_{i, \text{online}} = k\_{i, \text{base}} + \Delta k\_{i, \text{online}}$$
+  where $\Delta k\_{i, \text{online}}$ is subject to a $10\times$ $L\_2$ Bayesian shrinkage penalty pulling toward zero. Only players with statistically significant and persistent divergence across multiple tournaments develop non-zero online delta vectors.
+- **Editor / Package Vector**: $e\_{\text{pkg}} \in \mathbb{R}^D$ ($D = 6$), pooling topic requirements and stylistic characteristics of the package editors.
 
-### 1.2. Unconditional Format-Invariant Package Difficulty ($DL_{\text{intrinsic}}$)
+### 1.2. Unconditional Format-Invariant Package Difficulty ($DL\_{\text{intrinsic}}$)
 The tournament website's raw `trueDL` metric is circular and format-polluted: because unproctored online taking enables higher solve rates, an identical package played synchronously vs. asynchronously receives a $\sim 0.64$ lower `trueDL` on the website.
 
 The system decouples intrinsic question difficulty from play environment:
-- **Synchronous / Offline Tournaments**: $DL_{\text{intrinsic}} = TrueDL_{\text{site}}$.
-- **Asynchronous Mirror Packages**: Paired with their synchronous twins so that $DL_{\text{intrinsic}} = TrueDL_{\text{sync twin}}$.
-- **Unpaired Online Asynchronous Packages**: $DL_{\text{intrinsic}} = TrueDL_{\text{site}} + 0.64$.
+- **Synchronous / Offline Tournaments**: $DL\_{\text{intrinsic}} = TrueDL\_{\text{site}}$.
+- **Asynchronous Mirror Packages**: Paired with their synchronous twins so that $DL\_{\text{intrinsic}} = TrueDL\_{\text{sync twin}}$.
+- **Unpaired Online Asynchronous Packages**: $DL\_{\text{intrinsic}} = TrueDL\_{\text{site}} + 0.64$.
 - **Stage 1 Bayesian Editor Calibration**:
-  $$\beta_e = \frac{\sum (DL_{\text{intrinsic}} - DL_{\text{forecast}}) + n_0 \mu_0}{n + n_0}$$
+  $$\beta\_e = \frac{\sum (DL\_{\text{intrinsic}} - DL\_{\text{forecast}}) + n\_0 \mu\_0}{n + n\_0}$$
   Predicting unconditional intrinsic tournament difficulty before the tournament is played:
-  $$DL_{\text{calibrated}} = DL_{\text{forecast}} + \frac{1}{E} \sum_{e \in \text{Editors}} \beta_e$$
+  $$DL\_{\text{calibrated}} = DL\_{\text{forecast}} + \frac{1}{E} \sum\_{e \in \text{Editors}} \beta\_e$$
 - **Intrinsic Difficulty Sensitivity in Model**:
-  $$b_{\text{pkg}} = \bar{b}_{\text{editors}} + \alpha_{\text{dl}} \cdot (DL_{\text{intrinsic}} - DL_{\text{baseline}})$$
+  $$b\_{\text{pkg}} = \bar{b}\_{\text{editors}} + \alpha\_{\text{dl}} \cdot (DL\_{\text{intrinsic}} - DL\_{\text{baseline}})$$
 
-The higher solve rates of online tournaments are thus attributed strictly to the format baseline shift $b_{\text{format}}$, individual search factors $\Delta k_{i, \text{online}}$, and format-specific team communication $c_i(F)$, rather than artificially pretending the questions became easier.
+The higher solve rates of online tournaments are thus attributed strictly to the format baseline shift $b\_{\text{format}}$, individual search factors $\Delta k\_{i, \text{online}}$, and format-specific team communication $c\_i(F)$, rather than artificially pretending the questions became easier.
 
-### 1.3. Knowledge Pooling: Smooth-Max ($L_{\infty}$ Approximation)
-A team solves a question if **at least one** player possesses the required insight or factual knowledge. Pure linear averaging ($\frac{1}{n} \sum k_i$) penalizes teams for carrying specialists or support players, while hard maximum ($\max_i k_i$) suffers from zero gradients for non-maximum players and ignores team depth:
-$$K_{\text{team}, d} = k_{\max, d} + \tau \cdot \log \sum_{i=1}^{n} \exp\left(\frac{k_{i, d} - k_{\max, d}}{\tau}\right)$$
+### 1.3. Knowledge Pooling: Smooth-Max ($L\_{\infty}$ Approximation)
+A team solves a question if **at least one** player possesses the required insight or factual knowledge. Pure linear averaging ($\frac{1}{n} \sum k\_i$) penalizes teams for carrying specialists or support players, while hard maximum ($\max\_i k\_i$) suffers from zero gradients for non-maximum players and ignores team depth:
+$$K\_{\text{team}, d} = k\_{\max, d} + \tau \cdot \log \sum\_{i=1}^{n} \exp\left(\frac{k\_{i, d} - k\_{\max, d}}{\tau}\right)$$
 - $\tau = \text{softplus}(\text{raw temp}) + 0.05$: learnable temperature parameter.
 - As $\tau \to 0$, Smooth-Max approaches exact hard maximum without penalizing incomplete rosters (1–5 players).
 
 ### 1.4. Bounded Synergy & Experience Saturation
 Beyond individual knowledge, teams exhibit chemistry and discussion flow modeled via bilinear forms:
-$$S_{im}(t) = \left(c_i(F)^\top W_{\text{synergy}} c_m(F)\right) \cdot \left(1 + \beta_{\text{exp}} \tanh(\log(1 + N_{im}))\right) \cdot \exp(-\gamma_{\text{syn}} \Delta t_{im})$$
-- **Communication Vectors**: $c_i(F) = c_{\text{base}, i} + e_F \odot c_{\delta, i} \in \mathbb{R}^M$ ($M = 3$ core team roles: captain/selector, generator, critic).
+$$S\_{im}(t) = \left(c\_i(F)^\top W\_{\text{synergy}} c\_m(F)\right) \cdot \left(1 + \beta\_{\text{exp}} \tanh(\log(1 + N\_{im}))\right) \cdot \exp(-\gamma\_{\text{syn}} \Delta t\_{im})$$
+- **Communication Vectors**: $c\_i(F) = c\_{\text{base}, i} + e\_F \odot c\_{\delta, i} \in \mathbb{R}^M$ ($M = 3$ core team roles: captain/selector, generator, critic).
 - **Intensive Pairwise Average**: Total team synergy is scaled by available pairs:
-  $$S_{\text{team}} = \frac{1}{\max(1, \binom{n}{2})} \sum_{i < m} S_{im}$$
-- **Bounded Synergy Weight**: $w_{\text{syn}} = 0.25 \cdot \sigma(\text{raw synergy weight}) \in [0, 0.25]$. Constrains chemistry to realistic human bounds ($\approx \pm 2.5$ questions on a 120-question package) so team chemistry can never overpower individual knowledge.
-- **Experience Saturation**: $\tanh(\log(1 + N_{im}))$ models rapid initial familiarity over the first 2–3 games ($\approx 80\%$ of potential synergy) with a hard mathematical ceiling for veteran pairs.
+  $$S\_{\text{team}} = \frac{1}{\max(1, \binom{n}{2})} \sum\_{i \lt m} S\_{im}$$
+- **Bounded Synergy Weight**: $w\_{\text{syn}} = 0.25 \cdot \sigma(\text{raw synergy weight}) \in [0, 0.25]$. Constrains chemistry to realistic human bounds ($\approx \pm 2.5$ questions on a 120-question package) so team chemistry can never overpower individual knowledge.
+- **Experience Saturation**: $\tanh(\log(1 + N\_{im}))$ models rapid initial familiarity over the first 2–3 games ($\approx 80\%$ of potential synergy) with a hard mathematical ceiling for veteran pairs.
 - **Decay Half-Life**: Elapsed time since the pair's last joint game decays synergy with a learned half-life ($\approx 845$ days).
 
 ### 1.5. Inactivity Degradation & Skill Tracking
-During player hiatuses ($\Delta t_i > 365$ days):
-$$k_i(T_{\text{target}}) = k_i \odot \exp\left(-\vec{\lambda}_{\text{decay}} \max(0, \Delta t_i - G_{\text{grace}})\right)$$
+During player hiatuses ($\Delta t\_i \gt 365$ days):
+$$k\_i(T\_{\text{target}}) = k\_i \odot \exp\left(-\vec{\lambda}\_{\text{decay}} \max(0, \Delta t\_i - G\_{\text{grace}})\right)$$
 - **Factual Knowledge**: Fast decay (learned half-life $\approx 1600$ days / $\approx 4.4$ years).
 - **Logical / Analytical Ability**: Slow decay (learned half-life $\approx 5600$ days / $\approx 15$ years).
-- **Grace Period**: $G_{\text{grace}} \approx 365.6$ days.
+- **Grace Period**: $G\_{\text{grace}} \approx 365.6$ days.
 
 ---
 
@@ -125,7 +125,7 @@ Training reads `data/dataset.parquet`, produced by the sync project. Question te
 
 Model evaluated on **10,442,150 training observations** (95%), **274,793 validation observations** (2.5%), and **274,794 out-of-time test observations** (2.5%):
 
-| Metric | Baseline Linear Rasch / Elo | Previous High-Dim Model | Dual Latent ($D=6, M=3, DL_{\text{intrinsic}}$) |
+| Metric | Baseline Linear Rasch / Elo | Previous High-Dim Model | Dual Latent ($D=6, M=3, DL\_{\text{intrinsic}}$) |
 | :--- | :---: | :---: | :---: |
 | **Test ROC-AUC** | 0.5980 | 0.6898 | **0.6923** |
 | **Test LogLoss** | 0.6720 | 0.6358 | **0.6339** |
