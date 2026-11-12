@@ -25,10 +25,6 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=8.0.0",
-    # Imported by the App Engine service tests. The service itself is a separate uv project in gae/.
-    "flask>=3.0.0",
-    "requests>=2.32.0",
-    "pyyaml>=6.0.1",
 ]
 
 [project.scripts]

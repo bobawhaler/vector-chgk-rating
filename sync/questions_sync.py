@@ -230,7 +230,7 @@ def hashes_from_frame(frame: Any) -> dict[str, str]:
 
 
 def extract_pack_from_rsc(text: str) -> dict[str, Any] | None:
-    """Same RSC scrape as chgk_rating.gotquestions.extract_pack_from_rsc."""
+    """Same RSC scrape as corpus.gotquestions.extract_pack_from_rsc in the questions project."""
     if "NEXT_HTTP_ERROR_FALLBACK;404" in text:
         return None
     decoder = json.JSONDecoder()

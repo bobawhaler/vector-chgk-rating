@@ -1,7 +1,7 @@
 [project]
-name = "chgk-rating-gae"
+name = "chgk-sync"
 version = "0.1.0"
-description = "App Engine control service for the ChGK rating project"
+description = "App Engine service: daily ChGK downloads and a Telegram webhook"
 requires-python = ">=3.12"
 dependencies = [
     "flask>=3.0.0",
@@ -16,6 +16,11 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=8.0.0",
+    # Local upload/materialize only. uv export --no-dev keeps them out of App Engine.
+    "pandas>=2.2.0",
+    "pyarrow>=15.0.0",
+    "httpx>=0.27.0",
+    "click>=8.1.0",
 ]
 
 [tool.uv]

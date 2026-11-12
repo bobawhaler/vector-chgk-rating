@@ -34,12 +34,6 @@ DEFAULT_RATING_CREDITS_PATH: Final[Path] = DATA_DIR / "rating_credits.parquet"
 DEFAULT_MODEL_PATH: Final[Path] = MODELS_DIR / "best_model.pt"
 DEFAULT_META_PATH: Final[Path] = MODELS_DIR / "metadata.json"
 
-# GotQuestions defaults
-DEFAULT_GOTQUESTIONS_URL: Final[str] = "https://gotquestions.online"
-DEFAULT_GQ_CACHE_DB_PATH: Final[Path] = DATA_DIR / "gotquestions_cache.db"
-DEFAULT_GQ_QUESTIONS_PARQUET: Final[Path] = DATA_DIR / "gotquestions_questions.parquet"
-DEFAULT_GQ_PACKS_PARQUET: Final[Path] = DATA_DIR / "gotquestions_packs.parquet"
-
 
 @dataclass
 class ModelConfig:
@@ -69,17 +63,3 @@ class DataIngestConfig:
     max_requests_per_second: float = 10.0
     timeout_seconds: float = 15.0
     max_retries: int = 4
-
-
-@dataclass
-class GotQuestionsConfig:
-    """Configuration for polite ingestion from gotquestions.online."""
-
-    base_url: str = DEFAULT_GOTQUESTIONS_URL
-    cache_db_path: Path = DEFAULT_GQ_CACHE_DB_PATH
-    questions_parquet: Path = DEFAULT_GQ_QUESTIONS_PARQUET
-    packs_parquet: Path = DEFAULT_GQ_PACKS_PARQUET
-    max_requests_per_second: float = 1.0  # Gentle 1 req/s to prevent fail2ban / rate-limits
-    timeout_seconds: float = 15.0
-    max_retries: int = 4
-    consecutive_404_stop: int = 30  # Stop scanning when N consecutive packs return 404

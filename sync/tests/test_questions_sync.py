@@ -11,7 +11,7 @@ os.environ["ENV_YAML"] = "/nonexistent-gae-env.yaml"
 os.environ["GCS_BUCKET"] = ""
 os.environ["USE_DATASTORE"] = "0"
 
-_GAE = Path(__file__).resolve().parents[1] / "gae"
+_GAE = Path(__file__).resolve().parents[1]
 if str(_GAE) not in sys.path:
     sys.path.append(str(_GAE))
 

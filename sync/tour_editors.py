@@ -1,5 +1,8 @@
 """Tour editors from a rating.chgk.info tournament card.
 
+The rating project reads this same shape. Keep the two parsers the same:
+``../chgk_rating/tour_editors.py``.
+
 ``GET /tournaments/{id}`` returns ``credits``: each item is a tour or a question
 range and the people who edited it. ``tour: null`` and ``questions: null`` is
 the whole package. Question numbers are 1-based across the package, the same

@@ -16,13 +16,13 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from chgk_rating.config import (
+from corpus.config import (
     DEFAULT_GQ_CACHE_DB_PATH,
     DEFAULT_GQ_PACKS_PARQUET,
     DEFAULT_GQ_QUESTIONS_PARQUET,
     GotQuestionsConfig,
 )
-from chgk_rating.data_loader import AsyncRateLimiter
+from corpus.rate_limit import AsyncRateLimiter
 
 logger = logging.getLogger(__name__)
 

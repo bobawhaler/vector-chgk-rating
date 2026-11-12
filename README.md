@@ -1,6 +1,8 @@
 # ChGK Dual Latent Embedding Rating System
 
-Production-ready neural rating and tournament outcome prediction system for **What? Where? When? (Что? Где? Когда? / ChGK)**. Built on PyTorch and grounded in Multidimensional Item Response Theory (MIRT), collaborative filtering, and dynamic skill tracking principles.
+Neural rating and tournament outcome prediction for **What? Where? When? (Что? Где? Когда? / ChGK)**. Built on PyTorch and grounded in Multidimensional Item Response Theory (MIRT), collaborative filtering, and dynamic skill tracking principles.
+
+This repository holds three projects. The rating model is the repository root. Daily downloads and the Telegram webhook are [`sync`](sync). Question texts, authors, and package statistics are [`questions`](questions).
 
 ---
 
@@ -103,7 +105,7 @@ $$k_i(T_{\text{target}}) = k_i \odot \exp\left(-\vec{\lambda}_{\text{decay}} \ma
 
 ## 3. Data Sources & Ingestion Pipeline
 
-The system continuously synchronizes two official community data sources:
+Training reads `data/dataset.parquet`, produced by the sync project. Question texts are not loaded here. The figures below are the corpus those projects keep:
 
 1. **Official Rating Site API** ([`api.rating.chgk.info`](https://api.rating.chgk.info/)):
    - **Tournament Coverage**: **7,104 tournaments** spanning 2020–2026.
@@ -112,8 +114,8 @@ The system continuously synchronizes two official community data sources:
    - **Incremental Synchronization**: Automatically tracks `rating_last_sync` timestamp and invalidates cache only for edited tournaments.
 
 2. **GotQuestions Knowledge Base** ([`gotquestions.online`](https://gotquestions.online/)):
-   - **Packages**: **6,978 packages** in `data/gotquestions_packs.parquet`.
-   - **Questions**: **518,454 questions** with texts, accepted answers, authors, and per-tour editors in `data/gotquestions_questions.parquet`.
+   - **Packages**: **6,978 packages** in `questions/data/gotquestions_packs.parquet`.
+   - **Questions**: **518,454 questions** with texts, accepted answers, authors, and per-tour editors in `questions/data/gotquestions_questions.parquet`.
    - **Linked Coverage**: **110,261 questions** directly matched between rating observations and question texts/author profiles.
    - **Polite Ingestion**: Rate-limited crawler with automatic backoff and immediate halt on HTTP 429.
 
@@ -138,20 +140,22 @@ Model evaluated on **10,442,150 training observations** (95%), **274,793 validat
 ```bash
 uv sync
 
-# Run complete test suite (64 passing tests)
+# Run the rating test suite
 uv run pytest
 ```
 
-Commands below are run with `uv run`. The App Engine service in `gae/` is a separate uv project: its `requirements.txt` is exported from `gae/pyproject.toml` because App Engine installs from that file.
+Commands below are run with `uv run` from this directory.
 
-### 5.2. Incremental Data Updates
+### 5.2. Data
+The nightly job lives in `sync/`. It writes `data/dataset.parquet` and `data/rating_credits.parquet` when you materialize there:
+
 ```bash
-# Incrementally update tournament results from api.rating.chgk.info
-uv run python cli.py update-rating --lookback-days 14
-
-# Incrementally sync question packages from gotquestions.online
-uv run python cli.py fetch-questions --lookback-packs 20 --rate-limit 2.0
+cd sync
+uv run python cli.py materialize-rating
+uv run python cli.py materialize-data   # rating parquet, credits, and the questions parquet
 ```
+
+`fetch-data` and `update-rating` in this repository still build that parquet directly from `api.rating.chgk.info` when you are not using Cloud Storage. They are not the daily job.
 
 ### 5.3. Training the Model
 ```bash
@@ -185,63 +189,7 @@ uv run python cli.py run-api --host 0.0.0.0 --port 8000
 ```
 OpenAPI documentation available at `http://localhost:8000/docs`.
 
-### 5.6. Questions database on the free tier
-
-The question corpus (~522 000 rows, 171 MB) and the tournament-result table (`dataset.parquet`, 36 MB) both live in one **Cloud Storage** bucket in a US region (`us-central1`, `us-east1`, or `us-west1`; 5 GB-months free). The SQLite files next to them (`gotquestions_cache.db` 712 MB, `chgk_cache.db` 671 MB) are local HTTP caches, not the databases cron reads.
-
-| Object | What it is | Nightly job |
-| :--- | :--- | :--- |
-| `questions/snapshot.parquet` | gotquestions texts, answers, authors | uploaded once |
-| `questions/parts/*.jsonl.gz` | packs whose text changed | 03:30 Europe/Berlin |
-| `rating/snapshot.parquet` | team×question results from rating.chgk.info | uploaded once |
-| `rating/parts/*.jsonl.gz` | tournaments edited in the last 3 days, including older tournaments whose result was corrected | 04:00 Europe/Berlin, then Cloud Tasks until that edit list is done |
-| `rating/credits.jsonl.gz` | tour editors from the tournament card (`credits`) | uploaded once, then updated with each rating batch |
-| `state/*.json` | cursors | rewritten in place |
-
-A part replaces rows for the tournaments it names. Question rows and rating rows share `question_id` (`{tournament_id}_{n}`).
-
-Cron does not download the snapshots (an F1 instance has 256 MB of RAM). Work locally against the files the rest of the project already reads:
-
-```bash
-uv run python cli.py materialize-data
-uv run python cli.py link-questions          # how many rating questions have a text
-uv run python cli.py train --device cpu
-uv run python cli.py predict-tournament 14149
-uv run python cli.py run-api --host 0.0.0.0 --port 8000
-```
-
-`materialize-data` rewrites `data/gotquestions_questions.parquet` and `data/dataset.parquet` from the bucket. Training and the API do not talk to Cloud Storage themselves.
-
-```bash
-gcloud storage buckets create gs://PROJECT_ID-chgk-data \
-  --location=us-central1 --uniform-bucket-level-access
-gcloud storage buckets add-iam-policy-binding gs://PROJECT_ID-chgk-data \
-  --member=serviceAccount:PROJECT_ID@appspot.gserviceaccount.com \
-  --role=roles/storage.objectAdmin
-
-# Cloud Tasks queue is not created by app deploy. Name and region match gae/env.yaml.
-gcloud services enable cloudtasks.googleapis.com
-gcloud tasks queues create bot-tasks --location=us-central1
-
-gcloud app deploy gae/app.yaml gae/cron.yaml
-```
-
-`gcloud app deploy` does not upload the parquet files, and nightly cron only appends deltas. Once `GCS_BUCKET` is set, upload the local baselines from this machine:
-
-```bash
-uv run python cli.py upload-questions   # data/gotquestions_questions.parquet
-uv run python cli.py upload-rating      # data/dataset.parquet
-```
-
-`gae/requirements.txt` is generated. After changing `gae/pyproject.toml`:
-
-```bash
-cd gae
-uv lock
-uv export --no-dev --no-hashes --no-emit-project -o requirements.txt
-```
-
-`/questions`, `/rating`, and `/data` in the management bot report the cursors. The bot, training, and `run-api` stay as before: PyTorch does not run on F1.
+Question coverage (`link`, authors, search) is `questions/`. Deploy of the webhook and the bucket is documented in `sync/README.md`.
 
 ---
 

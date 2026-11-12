@@ -15,3 +15,5 @@ artifact_registry_policy.json
 uv.lock
 .python-version
 pyproject.toml
+data/
+cli.py

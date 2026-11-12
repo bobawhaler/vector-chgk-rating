@@ -1,8 +1,7 @@
 """Commands for the chgk-rating control bot.
 
-The App Engine service is the free-tier management shell. Model training,
-the parquet dataset, and the FastAPI rating API stay on a machine that can
-hold PyTorch.
+Nightly downloads and the Telegram webhook. Rating math lives in the
+rating project. Question-text analysis lives in the questions project.
 """
 
 from __future__ import annotations
@@ -13,10 +12,10 @@ from gae_platform.commands import CommandContext, command
 @command("service")
 def service_cmd(ctx: CommandContext) -> str:
     return (
-        "chgk-rating: управляющий бот на App Engine F1.\n"
+        "Синхронизация ЧГК: App Engine F1 и вебхук бота.\n"
         "Вопросы и результаты турнирного сайта лежат в Cloud Storage.\n"
         "Ночью: вопросы в 03:30, рейтинг в 04:00 (Europe/Berlin).\n"
-        "Локально после materialize-data: обучение и python cli.py run-api"
+        "Локально: python cli.py materialize-data — parquet для rating и questions."
     )
 
 

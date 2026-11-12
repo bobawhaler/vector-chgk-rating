@@ -9,8 +9,8 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from chgk_rating.config import GotQuestionsConfig
-from chgk_rating.gotquestions import (
+from corpus.config import GotQuestionsConfig
+from corpus.gotquestions import (
     GotQuestionsCache,
     GotQuestionsIngester,
     extract_pack_from_rsc,

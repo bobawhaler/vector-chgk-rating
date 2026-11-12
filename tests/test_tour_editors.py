@@ -2,14 +2,7 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
-_GAE = Path(__file__).resolve().parents[1] / "gae"
-if str(_GAE) not in sys.path:
-    sys.path.append(str(_GAE))
-
-from tour_editors import credit_record, editors_for_question, editors_for_span
+from chgk_rating.tour_editors import credit_record, editors_for_question, editors_for_span
 
 
 def _card() -> dict:
