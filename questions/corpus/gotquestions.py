@@ -23,6 +23,7 @@ from corpus.config import (
     GotQuestionsConfig,
 )
 from corpus.rate_limit import AsyncRateLimiter
+from corpus.records import frames_from_packs
 
 logger = logging.getLogger(__name__)
 
@@ -353,97 +354,7 @@ class GotQuestionsIngester:
 
         packs = self.cache.get_all_packs()
         logger.info("Compiling %d cached gotquestions packs into Parquet...", len(packs))
-
-        pack_records: List[Dict[str, Any]] = []
-        question_records: List[Dict[str, Any]] = []
-
-        for p in packs:
-            pack_id = int(p.get("id", 0))
-            title = str(p.get("title", ""))
-            raw_t_ids = p.get("tIds", [])
-            t_ids = [int(x) for x in raw_t_ids if str(x).isdigit()]
-            pub_date = str(p.get("pubDate", p.get("startDate", "")))[:10]
-
-            pack_records.append({
-                "pack_id": pack_id,
-                "title": title,
-                "rating_tournament_ids": t_ids,
-                "date": pub_date,
-                "tours_count": len(p.get("tours", [])),
-            })
-
-            global_q_idx = 0
-            for tour_idx, tour in enumerate(p.get("tours", []), 1):
-                tour_id = int(tour.get("id", 0))
-                tour_editors = tour.get("editors", [])
-                editor_names = []
-                editor_player_ids = []
-                for e in tour_editors:
-                    person = e.get("person", {})
-                    if person:
-                        name = person.get("name", "")
-                        p_id = person.get("playerId")
-                        if name:
-                            editor_names.append(name)
-                        if p_id:
-                            editor_player_ids.append(int(p_id))
-
-                for q in tour.get("questions", []):
-                    global_q_idx += 1
-                    q_num = int(q.get("number", global_q_idx))
-                    q_text = str(q.get("text", "")).strip()
-                    q_answer = str(q.get("answer", "")).strip()
-                    q_comment = str(q.get("comment", "")).strip()
-
-                    author_names = []
-                    author_player_ids = []
-                    for a in q.get("authors", []):
-                        person = a.get("person", {})
-                        if person:
-                            name = person.get("name", "")
-                            p_id = person.get("playerId")
-                            if name:
-                                author_names.append(name)
-                            if p_id:
-                                author_player_ids.append(int(p_id))
-
-                    # If this pack is mapped to rating tournaments, record rows for each tournament
-                    if t_ids:
-                        for tid in t_ids:
-                            question_records.append({
-                                "question_id": f"{tid}_{global_q_idx}",
-                                "rating_tournament_id": tid,
-                                "pack_id": pack_id,
-                                "tour_id": tour_id,
-                                "tour_number": tour_idx,
-                                "question_number": global_q_idx,
-                                "text": q_text,
-                                "answer": q_answer,
-                                "comment": q_comment,
-                                "author_names": author_names,
-                                "author_player_ids": author_player_ids,
-                                "editor_names": editor_names,
-                                "editor_player_ids": editor_player_ids,
-                            })
-                    else:
-                        question_records.append({
-                            "question_id": f"gq_{pack_id}_{global_q_idx}",
-                            "rating_tournament_id": 0,
-                            "pack_id": pack_id,
-                            "tour_id": tour_id,
-                            "tour_number": tour_idx,
-                            "question_number": global_q_idx,
-                            "text": q_text,
-                            "answer": q_answer,
-                            "comment": q_comment,
-                            "author_names": author_names,
-                            "author_player_ids": author_player_ids,
-                            "editor_names": editor_names,
-                            "editor_player_ids": editor_player_ids,
-                        })
-
-        packs_df = pd.DataFrame(pack_records)
-        questions_df = pd.DataFrame(question_records)
+        questions_df, packs_df = frames_from_packs(packs)
 
         p_path.parent.mkdir(parents=True, exist_ok=True)
         q_path.parent.mkdir(parents=True, exist_ok=True)

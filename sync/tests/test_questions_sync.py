@@ -145,6 +145,22 @@ def test_sync_advances_past_new_packs(tmp_path: Path) -> None:
     assert result.written == 1
 
 
+def test_records_keep_source_dates_and_people() -> None:
+    pack = _pack(5)
+    pack["title"] = "Название"
+    pack["startDate"] = "$D2024-05-01T00:00:00.000Z"
+    pack["editors"] = [{"person": {"name": "Редактор пакета", "playerId": 7}}]
+    pack["tours"][0]["questions"][0]["source"] = "https://example.test/a"
+    pack["tours"][0]["questions"][0]["zachet"] = "зачёт"
+    row = records_from_pack(pack)[0]
+    assert row["source"] == "https://example.test/a"
+    assert row["zachet"] == "зачёт"
+    assert row["start_date"] == "2024-05-01"
+    assert row["pack_title"] == "Название"
+    assert row["pack_editor_names"] == ["Редактор пакета"]
+    assert row["question_id"] == "100_1"
+
+
 def test_missing_snapshot_asks_for_upload() -> None:
     result = run_incremental(storage=MemoryStorage(), fetch_pack=lambda _pack_id: None, interval=0)
     assert not result.ok

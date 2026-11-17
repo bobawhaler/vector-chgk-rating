@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>База вопросов</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #1c1915;
+      --muted: #6b6258;
+      --line: #e3d9cc;
+      --paper: #f6f1e8;
+      --card: #fffdf8;
+      --accent: #8a3d22;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--paper);
+      font: 17px/1.45 "Iowan Old Style", Palatino, "Palatino Linotype", Georgia, serif;
+    }
+    header, main { width: min(920px, calc(100% - 32px)); margin: 0 auto; }
+    header { padding: 28px 0 8px; }
+    h1 { font-size: 28px; font-weight: 600; margin: 0 0 4px; }
+    .meta { color: var(--muted); margin: 0; font-size: 15px; }
+    form {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px 12px;
+      margin: 18px 0;
+      padding: 14px;
+      background: var(--card);
+      border: 1px solid var(--line);
+    }
+    label { display: flex; flex-direction: column; gap: 4px; font: 13px/1.3 "Avenir Next", "Segoe UI", sans-serif; color: var(--muted); }
+    label.wide { grid-column: span 2; }
+    input, select, button {
+      font: 15px/1.3 "Avenir Next", "Segoe UI", sans-serif;
+      color: var(--ink);
+      background: #fff;
+      border: 1px solid #d4c8b8;
+      border-radius: 2px;
+      padding: 7px 8px;
+    }
+    .actions { display: flex; align-items: end; gap: 8px; }
+    button, .nav button { cursor: pointer; background: var(--accent); color: #fffdf8; border-color: var(--accent); }
+    button.quiet { background: transparent; color: var(--ink); }
+    .status { min-height: 1.4em; color: var(--muted); font: 14px/1.4 "Avenir Next", "Segoe UI", sans-serif; }
+    article {
+      background: var(--card);
+      border: 1px solid var(--line);
+      padding: 16px 18px 18px;
+      margin: 0 0 12px;
+    }
+    article h2 { font-size: 18px; font-weight: 600; margin: 0 0 4px; }
+    article h2 a { color: inherit; }
+    .sub { color: var(--muted); font: 14px/1.35 "Avenir Next", "Segoe UI", sans-serif; margin: 0 0 10px; }
+    .text { white-space: pre-wrap; margin: 0; }
+    .block { margin: 10px 0 0; }
+    .block b { font-weight: 600; }
+    .nav { display: flex; gap: 8px; margin: 8px 0 28px; }
+    @media (max-width: 720px) {
+      form { grid-template-columns: 1fr 1fr; }
+      label.wide, .actions { grid-column: span 2; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>База вопросов</h1>
+    <p class="meta" id="meta">Локальный каталог</p>
+  </header>
+  <main>
+    <form id="filters">
+      <label class="wide">Текст
+        <input name="text" type="search" autocomplete="off">
+      </label>
+      <label>Где искать
+        <select name="where">
+          <option value="text">текст</option>
+          <option value="answer">ответ</option>
+          <option value="comment">комментарий</option>
+          <option value="source">источник</option>
+          <option value="all">везде</option>
+        </select>
+      </label>
+      <label>На странице
+        <select name="limit">
+          <option>20</option>
+          <option>50</option>
+          <option>100</option>
+        </select>
+      </label>
+      <label>Автор
+        <input name="author" autocomplete="off">
+      </label>
+      <label>ID автора
+        <input name="author_id" inputmode="numeric">
+      </label>
+      <label>Редактор
+        <input name="editor" autocomplete="off">
+      </label>
+      <label>ID редактора
+        <input name="editor_id" inputmode="numeric">
+      </label>
+      <label class="wide">Пакет
+        <input name="pack" autocomplete="off">
+      </label>
+      <label>ID пакета
+        <input name="pack_id" inputmode="numeric">
+      </label>
+      <label>Турнир
+        <input name="tournament" inputmode="numeric">
+      </label>
+      <label>Тур
+        <input name="tour" inputmode="numeric">
+      </label>
+      <label>Номер вопроса
+        <input name="number" inputmode="numeric">
+      </label>
+      <label>С даты
+        <input name="since" placeholder="ГГГГ-ММ-ДД">
+      </label>
+      <label>По дату
+        <input name="until" placeholder="ГГГГ-ММ-ДД">
+      </label>
+      <div class="actions">
+        <button type="submit">Найти</button>
+        <button type="button" class="quiet" id="reset">Сбросить</button>
+      </div>
+    </form>
+    <p class="status" id="status"></p>
+    <div id="results"></div>
+    <div class="nav" id="nav" hidden>
+      <button type="button" id="prev">Назад</button>
+      <button type="button" id="next">Дальше</button>
+    </div>
+  </main>
+  <script>
+    const form = document.querySelector("#filters");
+    const results = document.querySelector("#results");
+    const status = document.querySelector("#status");
+    const nav = document.querySelector("#nav");
+    let offset = 0;
+    let total = 0;
+
+    function paramsFromForm() {
+      const params = new URLSearchParams();
+      for (const [key, value] of new FormData(form)) {
+        const text = String(value).trim();
+        if (text && !(key === "where" && text === "text") && !(key === "limit" && text === "20")) {
+          params.set(key, text);
+        }
+      }
+      if (offset > 0) params.set("offset", String(offset));
+      return params;
+    }
+
+    function fillForm(params) {
+      for (const field of form.elements) {
+        if (!field.name || field.type === "submit" || field.type === "button") continue;
+        field.value = params.get(field.name) || (field.name === "where" ? "text" : field.name === "limit" ? "20" : "");
+      }
+    }
+
+    function people(list) {
+      return (Array.isArray(list) ? list : []).map((item) => String(item).trim()).filter(Boolean);
+    }
+
+    function addBlock(parent, label, value) {
+      const text = String(value || "").trim();
+      if (!text) return;
+      const p = document.createElement("p");
+      p.className = "block";
+      const title = document.createElement("b");
+      title.textContent = label + ": ";
+      p.appendChild(title);
+      if (label === "Источник") {
+        const parts = text.split(/(\s+)/);
+        for (const part of parts) {
+          if (/^https?:\/\/\S+$/.test(part)) {
+            const link = document.createElement("a");
+            link.href = part;
+            link.textContent = part;
+            link.target = "_blank";
+            link.rel = "noreferrer";
+            p.appendChild(link);
+          } else {
+            p.appendChild(document.createTextNode(part));
+          }
+        }
+      } else {
+        const body = document.createElement("span");
+        body.style.whiteSpace = "pre-wrap";
+        body.textContent = text;
+        p.appendChild(body);
+      }
+      parent.appendChild(p);
+    }
+
+    function when(row) {
+      const start = String(row.start_date || "");
+      const end = String(row.end_date || "");
+      if (start && end && start !== end) return start + " — " + end;
+      return start || end || String(row.pub_date || "");
+    }
+
+    function render(payload) {
+      results.replaceChildren();
+      total = payload.total || 0;
+      const shown = (payload.rows || []).length;
+      if (!shown) {
+        status.textContent = "Ничего не найдено.";
+        nav.hidden = true;
+        return;
+      }
+      const from = offset + 1;
+      const to = offset + shown;
+      status.textContent = "Найдено " + total + ". Показаны " + from + "–" + to + ".";
+      for (const row of payload.rows) {
+        const card = document.createElement("article");
+        const heading = document.createElement("h2");
+        const title = String(row.pack_title || "").trim() || ("Пакет " + row.pack_id);
+        if (row.pack_id) {
+          const link = document.createElement("a");
+          link.href = "https://gotquestions.online/pack/" + row.pack_id;
+          link.target = "_blank";
+          link.rel = "noreferrer";
+          link.textContent = title;
+          heading.appendChild(link);
+        } else {
+          heading.textContent = title;
+        }
+        card.appendChild(heading);
+        const sub = document.createElement("p");
+        sub.className = "sub";
+        const bits = [];
+        const played = when(row);
+        if (played) bits.push(played);
+        if (row.tour_number) bits.push("тур " + row.tour_number);
+        const number = row.number_in_tour || row.question_number;
+        if (number) bits.push("вопрос " + number);
+        if (row.pack_id) bits.push("пакет " + row.pack_id);
+        if (row.rating_tournament_id) bits.push("турнир " + row.rating_tournament_id);
+        sub.textContent = bits.join(" · ");
+        card.appendChild(sub);
+        const authors = people(row.author_names);
+        const editors = people(row.editor_names);
+        const packEditors = people(row.pack_editor_names);
+        if (authors.length || editors.length || packEditors.length) {
+          const who = document.createElement("p");
+          who.className = "sub";
+          const parts = [];
+          if (authors.length) parts.push("Авторы: " + authors.join(", "));
+          if (editors.length) parts.push("Редакторы: " + editors.join(", "));
+          if (packEditors.length && packEditors.join("|") !== editors.join("|")) {
+            parts.push("Редакторы пакета: " + packEditors.join(", "));
+          }
+          who.textContent = parts.join(" · ");
+          card.appendChild(who);
+        }
+        const text = document.createElement("p");
+        text.className = "text";
+        text.textContent = String(row.text || "");
+        card.appendChild(text);
+        addBlock(card, "Ответ", row.answer);
+        addBlock(card, "Зачёт", row.zachet);
+        addBlock(card, "Незачёт", row.nezachet);
+        addBlock(card, "Комментарий", row.comment);
+        addBlock(card, "Источник", row.source);
+        results.appendChild(card);
+      }
+      nav.hidden = total <= shown && offset === 0;
+      document.querySelector("#prev").disabled = offset <= 0;
+      document.querySelector("#next").disabled = offset + shown >= total;
+    }
+
+    async function load() {
+      const params = paramsFromForm();
+      history.replaceState(null, "", params.toString() ? "?" + params : location.pathname);
+      status.textContent = "Ищу…";
+      results.replaceChildren();
+      const response = await fetch("/api/questions?" + params);
+      const payload = await response.json();
+      if (!response.ok) {
+        status.textContent = payload.error || "Не удалось выполнить запрос.";
+        nav.hidden = true;
+        return;
+      }
+      render(payload);
+    }
+
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      offset = 0;
+      load();
+    });
+    document.querySelector("#reset").addEventListener("click", () => {
+      form.reset();
+      offset = 0;
+      load();
+    });
+    document.querySelector("#prev").addEventListener("click", () => {
+      const limit = Number(new FormData(form).get("limit") || 20);
+      offset = Math.max(0, offset - limit);
+      load();
+    });
+    document.querySelector("#next").addEventListener("click", () => {
+      const limit = Number(new FormData(form).get("limit") || 20);
+      offset += limit;
+      load();
+    });
+
+    const initial = new URLSearchParams(location.search);
+    offset = Number(initial.get("offset") || 0) || 0;
+    fillForm(initial);
+    fetch("/api/meta").then((response) => response.json()).then((meta) => {
+      const bits = [];
+      if (meta.questions) bits.push(meta.questions + " вопросов");
+      if (meta.packs) bits.push(meta.packs + " пакетов");
+      if (meta.span) bits.push(meta.span);
+      if (meta.with_source) bits.push("с источником " + meta.with_source);
+      document.querySelector("#meta").textContent = bits.join(" · ") || "Локальный каталог пуст.";
+    });
+    load();
+  </script>
+</body>
+</html>

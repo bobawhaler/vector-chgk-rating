@@ -19,6 +19,8 @@ from corpus.gotquestions import (
 SAMPLE_PACK = {
     "id": 7099,
     "title": "Кубок Бесконечности. Финал",
+    "startDate": "$D2024-05-01T00:00:00.000Z",
+    "endDate": "2024-05-20",
     "pubDate": "2024-05-20",
     "tIds": [14031, 14032],
     "tours": [
@@ -33,7 +35,9 @@ SAMPLE_PACK = {
                     "number": 1,
                     "text": "Тестовый текст вопроса 1",
                     "answer": "Тестовый ответ 1",
+                    "zachet": "точный зачёт",
                     "comment": "Тестовый комментарий 1",
+                    "source": "https://example.test/source",
                     "authors": [
                         {"person": {"id": 888, "name": "Тестовый Автор", "playerId": 12345}}
                     ],
@@ -142,6 +146,11 @@ def test_export_to_parquet(tmp_path: Path) -> None:
     assert row_q1["editor_player_ids"] == [155079]
     assert row_q1["text"] == "Тестовый текст вопроса 1"
     assert row_q1["answer"] == "Тестовый ответ 1"
+    assert row_q1["source"] == "https://example.test/source"
+    assert row_q1["zachet"] == "точный зачёт"
+    assert row_q1["start_date"] == "2024-05-01"
+    assert row_q1["pack_title"] == "Кубок Бесконечности. Финал"
+    assert p_df.iloc[0]["date"] == "2024-05-01"
 
 
 @pytest.mark.anyio

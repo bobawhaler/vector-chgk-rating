@@ -13,6 +13,7 @@ DEFAULT_GOTQUESTIONS_URL = "https://gotquestions.online"
 DEFAULT_GQ_CACHE_DB_PATH = DATA_DIR / "gotquestions_cache.db"
 DEFAULT_GQ_QUESTIONS_PARQUET = DATA_DIR / "gotquestions_questions.parquet"
 DEFAULT_GQ_PACKS_PARQUET = DATA_DIR / "gotquestions_packs.parquet"
+DEFAULT_KNOWLEDGE_DB = DATA_DIR / "knowledge.sqlite"
 
 
 @dataclass

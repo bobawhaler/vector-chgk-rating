@@ -184,6 +184,39 @@ def _names(value: object) -> list[str]:
     return [str(item) for item in value if item is not None and str(item) != ""]
 
 
+def _day(value: object) -> str:
+    text = str(value or "").strip()
+    if text.startswith("$D"):
+        text = text[2:]
+    if len(text) >= 10 and text[4] == "-" and text[7] == "-":
+        return text[:10]
+    return ""
+
+
+def _people(items: object) -> tuple[list[str], list[int]]:
+    names: list[str] = []
+    player_ids: list[int] = []
+    if not isinstance(items, list):
+        return names, player_ids
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        person = item.get("person")
+        if not isinstance(person, dict):
+            continue
+        name = str(person.get("name") or "").strip()
+        if name:
+            names.append(name)
+        player_id = person.get("playerId")
+        if not player_id:
+            continue
+        try:
+            player_ids.append(int(player_id))
+        except (TypeError, ValueError):
+            continue
+    return names, player_ids
+
+
 def _ints(value: object) -> list[int]:
     if value is None or isinstance(value, float):
         return []
@@ -210,6 +243,9 @@ def pack_hash(records: list[dict[str, Any]]) -> str:
             "text": str(row.get("text") or ""),
             "answer": str(row.get("answer") or ""),
             "comment": str(row.get("comment") or ""),
+            "source": str(row.get("source") or ""),
+            "zachet": str(row.get("zachet") or ""),
+            "nezachet": str(row.get("nezachet") or ""),
             "author_names": _names(row.get("author_names")),
             "author_player_ids": _ints(row.get("author_player_ids")),
             "editor_names": _names(row.get("editor_names")),
@@ -254,41 +290,42 @@ def records_from_pack(pack: dict[str, Any]) -> list[dict[str, Any]]:
     pack_id = int(pack.get("id") or 0)
     raw_t_ids = pack.get("tIds") or []
     t_ids = [int(item) for item in raw_t_ids if str(item).isdigit()]
+    start_date = _day(pack.get("startDate"))
+    end_date = _day(pack.get("endDate"))
+    pub_date = _day(pack.get("pubDate"))
+    pack_title = str(pack.get("title") or "")
+    pack_editor_names, pack_editor_player_ids = _people(pack.get("editors"))
     records: list[dict[str, Any]] = []
     global_q_idx = 0
     for tour_idx, tour in enumerate(pack.get("tours") or [], 1):
         tour_id = int(tour.get("id") or 0)
-        editor_names: list[str] = []
-        editor_player_ids: list[int] = []
-        for editor in tour.get("editors") or []:
-            person = editor.get("person") or {}
-            if person.get("name"):
-                editor_names.append(str(person["name"]))
-            if person.get("playerId"):
-                editor_player_ids.append(int(person["playerId"]))
+        editor_names, editor_player_ids = _people(tour.get("editors"))
         for question in tour.get("questions") or []:
             global_q_idx += 1
             q_num = int(question.get("number") or global_q_idx)
-            author_names: list[str] = []
-            author_player_ids: list[int] = []
-            for author in question.get("authors") or []:
-                person = author.get("person") or {}
-                if person.get("name"):
-                    author_names.append(str(person["name"]))
-                if person.get("playerId"):
-                    author_player_ids.append(int(person["playerId"]))
+            author_names, author_player_ids = _people(question.get("authors"))
             base = {
                 "pack_id": pack_id,
+                "pack_title": pack_title,
                 "tour_id": tour_id,
                 "tour_number": tour_idx,
                 "question_number": q_num,
+                "number_in_tour": q_num,
                 "text": str(question.get("text") or "").strip(),
                 "answer": str(question.get("answer") or "").strip(),
+                "zachet": str(question.get("zachet") or "").strip(),
+                "nezachet": str(question.get("nezachet") or "").strip(),
                 "comment": str(question.get("comment") or "").strip(),
+                "source": str(question.get("source") or "").strip(),
+                "start_date": start_date,
+                "end_date": end_date,
+                "pub_date": pub_date,
                 "author_names": author_names,
                 "author_player_ids": author_player_ids,
                 "editor_names": editor_names,
                 "editor_player_ids": editor_player_ids,
+                "pack_editor_names": pack_editor_names,
+                "pack_editor_player_ids": pack_editor_player_ids,
             }
             targets = t_ids or [0]
             for tournament_id in targets:
