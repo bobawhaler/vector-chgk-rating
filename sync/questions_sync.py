@@ -19,6 +19,7 @@ import io
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -265,25 +266,100 @@ def hashes_from_frame(frame: Any) -> dict[str, str]:
     return revisions
 
 
-def extract_pack_from_rsc(text: str) -> dict[str, Any] | None:
+_REF = re.compile(r"^\$([0-9a-fA-F]+)$")
+_ROW_ID = re.compile(rb"[0-9a-fA-F]+")
+
+
+def _rsc_text_chunks(payload: bytes) -> dict[str, str]:
+    """Same outlined-text rows as corpus.gotquestions.rsc_text_chunks."""
+    chunks: dict[str, str] = {}
+    pos = 0
+    limit = len(payload)
+    while pos < limit:
+        if payload[pos:pos + 1] in (b"\n", b"\r"):
+            pos += 1
+            continue
+        colon = payload.find(b":", pos, pos + 16)
+        row_id = payload[pos:colon] if colon != -1 else b""
+        if colon == -1 or not _ROW_ID.fullmatch(row_id):
+            newline = payload.find(b"\n", pos)
+            if newline == -1:
+                break
+            pos = newline + 1
+            continue
+        tag = colon + 1
+        if tag < limit and payload[tag:tag + 1] == b"T":
+            comma = payload.find(b",", tag + 1, tag + 12)
+            if comma == -1:
+                break
+            try:
+                length = int(payload[tag + 1:comma], 16)
+            except ValueError:
+                break
+            start = comma + 1
+            end = start + length
+            if end > limit:
+                break
+            chunks[row_id.decode()] = payload[start:end].decode("utf-8", errors="replace")
+            pos = end
+            continue
+        newline = payload.find(b"\n", tag)
+        if newline == -1:
+            break
+        pos = newline + 1
+    return chunks
+
+
+def _resolve_refs(value: Any, chunks: dict[str, str]) -> Any:
+    if isinstance(value, str):
+        match = _REF.match(value)
+        if match and match.group(1) in chunks:
+            return chunks[match.group(1)]
+        return value
+    if isinstance(value, list):
+        return [_resolve_refs(item, chunks) for item in value]
+    if isinstance(value, dict):
+        return {key: _resolve_refs(item, chunks) for key, item in value.items()}
+    return value
+
+
+def extract_pack_from_rsc(text: str | bytes, pack_id: int | None = None) -> dict[str, Any] | None:
     """Same RSC scrape as corpus.gotquestions.extract_pack_from_rsc in the questions project."""
-    if "NEXT_HTTP_ERROR_FALLBACK;404" in text:
+    if isinstance(text, bytes):
+        raw = text
+        body = text.decode("utf-8", errors="replace")
+    else:
+        body = text
+        raw = text.encode("utf-8")
+    if "NEXT_HTTP_ERROR_FALLBACK;404" in body:
         return None
     decoder = json.JSONDecoder()
+    candidates: list[dict[str, Any]] = []
     pos = 0
     target = '"pack":{'
-    while pos < len(text):
-        idx = text.find(target, pos)
+    while pos < len(body):
+        idx = body.find(target, pos)
         if idx == -1:
             break
         try:
-            obj, _ = decoder.raw_decode(text, idx + len('"pack":'))
-            if isinstance(obj, dict) and "id" in obj:
-                return obj
-        except Exception:
-            pass
+            obj, _ = decoder.raw_decode(body, idx + len('"pack":'))
+        except json.JSONDecodeError:
+            pos = idx + len(target)
+            continue
+        if isinstance(obj, dict) and "id" in obj:
+            candidates.append(obj)
         pos = idx + len(target)
-    return None
+    if pack_id is not None:
+        matched = [pack for pack in candidates if pack.get("id") == pack_id]
+        with_tours = [pack for pack in matched if pack.get("tours")]
+        chosen = with_tours[0] if with_tours else (matched[0] if matched else None)
+    else:
+        with_tours = [pack for pack in candidates if pack.get("tours")]
+        chosen = with_tours[0] if with_tours else (candidates[0] if candidates else None)
+    if chosen is None:
+        return None
+    resolved = _resolve_refs(chosen, _rsc_text_chunks(raw))
+    return resolved if isinstance(resolved, dict) else None
 
 
 def records_from_pack(pack: dict[str, Any]) -> list[dict[str, Any]]:
@@ -392,7 +468,7 @@ def _fetch_live(pack_id: int) -> dict[str, Any] | None:
         return None
     if response.status_code != 200:
         return None
-    pack = extract_pack_from_rsc(response.text)
+    pack = extract_pack_from_rsc(response.content, pack_id)
     if pack is None or int(pack.get("id") or 0) != pack_id:
         return None
     return pack

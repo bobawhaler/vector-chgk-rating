@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sqlite3
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import httpx
 import pandas as pd
@@ -33,25 +34,120 @@ class GotQuestionsBlockedException(Exception):
     pass
 
 
-def extract_pack_from_rsc(text: str) -> Optional[Dict[str, Any]]:
-    """Extract the structured pack dict from a React Server Component (RSC) response stream."""
-    if "NEXT_HTTP_ERROR_FALLBACK;404" in text:
-        return None
+_REF = re.compile(r"^\$([0-9a-fA-F]+)$")
+_ROW_ID = re.compile(rb"[0-9a-fA-F]+")
+
+
+def rsc_text_chunks(payload: bytes) -> dict[str, str]:
+    """Text blocks the site outlines beside the pack JSON.
+
+    A long question or comment is not stored in the field. The field holds
+    ``$1a``, and the bytes live in a length-prefixed row ``1a:T<hex>,<text>``.
+    The length counts UTF-8 bytes, and the text may contain newlines.
+    """
+    chunks: dict[str, str] = {}
+    pos = 0
+    limit = len(payload)
+    while pos < limit:
+        if payload[pos:pos + 1] in (b"\n", b"\r"):
+            pos += 1
+            continue
+        colon = payload.find(b":", pos, pos + 16)
+        row_id = payload[pos:colon] if colon != -1 else b""
+        if colon == -1 or not _ROW_ID.fullmatch(row_id):
+            newline = payload.find(b"\n", pos)
+            if newline == -1:
+                break
+            pos = newline + 1
+            continue
+        tag = colon + 1
+        if tag < limit and payload[tag:tag + 1] == b"T":
+            comma = payload.find(b",", tag + 1, tag + 12)
+            if comma == -1:
+                break
+            try:
+                length = int(payload[tag + 1:comma], 16)
+            except ValueError:
+                break
+            start = comma + 1
+            end = start + length
+            if end > limit:
+                break
+            chunks[row_id.decode()] = payload[start:end].decode("utf-8", errors="replace")
+            pos = end
+            continue
+        newline = payload.find(b"\n", tag)
+        if newline == -1:
+            break
+        pos = newline + 1
+    return chunks
+
+
+def _resolve_refs(value: Any, chunks: Mapping[str, str]) -> Any:
+    if isinstance(value, str):
+        match = _REF.match(value)
+        if match and match.group(1) in chunks:
+            return chunks[match.group(1)]
+        return value
+    if isinstance(value, list):
+        return [_resolve_refs(item, chunks) for item in value]
+    if isinstance(value, dict):
+        return {key: _resolve_refs(item, chunks) for key, item in value.items()}
+    return value
+
+
+def _pack_objects(body: str) -> list[Dict[str, Any]]:
     decoder = json.JSONDecoder()
+    found: list[Dict[str, Any]] = []
     pos = 0
     target = '"pack":{'
-    while pos < len(text):
-        idx = text.find(target, pos)
+    while pos < len(body):
+        idx = body.find(target, pos)
         if idx == -1:
             break
         try:
-            obj, _ = decoder.raw_decode(text, idx + len('"pack":'))
-            if isinstance(obj, dict) and "id" in obj:
-                return obj
-        except Exception:
-            pass
+            obj, _ = decoder.raw_decode(body, idx + len('"pack":'))
+        except json.JSONDecodeError:
+            pos = idx + len(target)
+            continue
+        if isinstance(obj, dict) and "id" in obj:
+            found.append(obj)
         pos = idx + len(target)
-    return None
+    return found
+
+
+def _choose_pack(candidates: Sequence[Dict[str, Any]], pack_id: Optional[int]) -> Optional[Dict[str, Any]]:
+    if pack_id is not None:
+        matched = [pack for pack in candidates if pack.get("id") == pack_id]
+        if not matched:
+            return None
+        with_tours = [pack for pack in matched if pack.get("tours")]
+        return with_tours[0] if with_tours else matched[0]
+    with_tours = [pack for pack in candidates if pack.get("tours")]
+    if with_tours:
+        return with_tours[0]
+    return candidates[0] if candidates else None
+
+
+def extract_pack_from_rsc(text: str | bytes, pack_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    """Extract the structured pack dict from a React Server Component (RSC) response stream.
+
+    Outlined ``$id`` strings are replaced with the text row of that id. A page
+    can mention several packs; ``pack_id`` selects the requested one, and
+    otherwise the pack that carries its tours is used.
+    """
+    if isinstance(text, bytes):
+        raw = text
+        body = text.decode("utf-8", errors="replace")
+    else:
+        body = text
+        raw = text.encode("utf-8")
+    if "NEXT_HTTP_ERROR_FALLBACK;404" in body:
+        return None
+    chosen = _choose_pack(_pack_objects(body), pack_id)
+    if chosen is None:
+        return None
+    return _resolve_refs(chosen, rsc_text_chunks(raw))
 
 
 def _find_pack_in_obj(obj: Any) -> Optional[Dict[str, Any]]:
@@ -227,7 +323,7 @@ class GotQuestionsIngester:
                         self.cache.mark_not_found(pack_id)
                         return None
 
-                    pack = extract_pack_from_rsc(resp.text)
+                    pack = extract_pack_from_rsc(resp.content, pack_id)
                     if pack is not None and pack.get("id") == pack_id:
                         self.cache.save_pack(pack_id, pack)
                         return pack

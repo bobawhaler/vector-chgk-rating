@@ -75,6 +75,47 @@ def test_extract_pack_from_rsc() -> None:
     assert extract_pack_from_rsc('1:{"other_data":123}') is None
 
 
+def test_extract_resolves_outlined_text() -> None:
+    blitz = "Блиц.\n1. Первая строка ё"
+    note = "Длинный комментарий"
+    pack = {
+        "id": 5,
+        "title": "Пакет",
+        "startDate": "$D2024-05-01T00:00:00.000Z",
+        "tours": [
+            {
+                "questions": [
+                    {"number": 1, "text": "$1a", "comment": "$19", "answer": "$ff"},
+                ]
+            }
+        ],
+    }
+    decoy = {"id": 9, "title": "Карточка"}
+
+    def outlined(row_id: str, value: str) -> bytes:
+        blob = value.encode()
+        return f"{row_id}:T{len(blob):x},".encode() + blob
+
+    payload = b"".join([
+        b'0:{"pack":' + json.dumps(decoy, ensure_ascii=False).encode() + b"}\n",
+        b'1:{"pack":' + json.dumps(pack, ensure_ascii=False).encode() + b"}\n",
+        outlined("19", note),
+        outlined("1a", blitz),
+        b"9:null\n",
+    ])
+    extracted = extract_pack_from_rsc(payload, pack_id=5)
+    assert extracted is not None
+    question = extracted["tours"][0]["questions"][0]
+    assert question["text"] == blitz
+    assert question["comment"] == note
+    assert question["answer"] == "$ff"
+    assert extracted["startDate"] == "$D2024-05-01T00:00:00.000Z"
+    card = extract_pack_from_rsc(payload, pack_id=9)
+    assert card is not None and card["title"] == "Карточка"
+    first = extract_pack_from_rsc(payload)
+    assert first is not None and first["id"] == 5
+
+
 def test_gotquestions_cache(tmp_path: Path) -> None:
     db_path = tmp_path / "gq_test.db"
     cache = GotQuestionsCache(db_path)
